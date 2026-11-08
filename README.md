@@ -135,3 +135,7 @@ A person says "Алиса Львовна, включи свет". The speaker wa
 - **A short Russian reply says the request failed.** The selected assistant is gone, Assist returned empty speech, or the Assist call raised. The dialogue for that entry is closed. If the assistant was removed, Home Assistant shows a repair on the entry; reconfigure the entry and choose an assistant. The loss is logged once, and the recovery is logged once.
 - **The body is rejected with HTTP 400.** `input` is missing or is not a list, or the last `user` content is not a string. Assist is not called.
 - **The speaker stays silent.** The bridge rejects a reply that contains tool-call markup. This integration returns only plain `output_text` and does not add a `function_call`.
+
+## License
+
+Apache License 2.0. The terms are in [LICENSE](LICENSE).
