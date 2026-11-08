@@ -1,0 +1,8 @@
+homeassistant==2026.10.4
+pytest-homeassistant-custom-component==0.13.375
+ruff==0.17.4
+mypy==2.4.1
+pytest-cov==7.1.0
+gazetteer-matcher==1.1.0
+hassil==3.12.1
+home-assistant-intents==2026.10.6

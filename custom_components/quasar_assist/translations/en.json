@@ -1,0 +1,49 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect Quasar Assist",
+        "description": "Choose a voice assistant that is already set up and how long its dialogue stays open.",
+        "data": {
+          "agent_id": "Voice assistant",
+          "conversation_ttl": "Dialogue lifetime"
+        },
+        "data_description": {
+          "agent_id": "One of the voice assistants already set up in Home Assistant. There is no free-text entry and no default.",
+          "conversation_ttl": "Seconds after a successful reply before the next phrase starts a new dialogue. The default is 90."
+        }
+      },
+      "reconfigure": {
+        "title": "Adjust Quasar Assist",
+        "description": "Change the voice assistant or the dialogue lifetime without deleting this entry.",
+        "data": {
+          "agent_id": "Voice assistant",
+          "conversation_ttl": "Dialogue lifetime"
+        },
+        "data_description": {
+          "agent_id": "The voice assistant used for the next phrase.",
+          "conversation_ttl": "Seconds the dialogue stays open after a successful reply."
+        }
+      }
+    },
+    "error": {
+      "assistant_not_found": "Choose a voice assistant that is set up in Home Assistant.",
+      "invalid_ttl": "Enter a dialogue lifetime of at least 1 second."
+    },
+    "abort": {
+      "no_assistants": "Set up a voice assistant in Home Assistant before creating this entry.",
+      "reconfigure_successful": "Quasar Assist was updated."
+    }
+  },
+  "exceptions": {
+    "assistant_unavailable": {
+      "message": "The voice assistant for Quasar Assist entry {entry_id} is no longer available. Reconfigure the entry and choose an assistant."
+    }
+  },
+  "issues": {
+    "assistant_unavailable": {
+      "title": "Voice assistant unavailable",
+      "description": "The voice assistant for Quasar Assist entry {entry_id} is no longer available. Reconfigure the entry and choose an assistant. The dialogue for this entry stays closed until you do."
+    }
+  }
+}

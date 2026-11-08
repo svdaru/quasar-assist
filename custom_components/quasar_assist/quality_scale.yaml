@@ -1,0 +1,117 @@
+rules:
+  # Bronze
+  action-setup:
+    status: exempt
+    comment: Действий у интеграции нет.
+  appropriate-polling:
+    status: exempt
+    comment: Опроса нет.
+  brands: done
+  common-modules:
+    status: exempt
+    comment: Сущностей нет.
+  config-flow: done
+  config-flow-test-coverage: done
+  dependency-transparency:
+    status: exempt
+    comment: Внешней библиотеки нет.
+  docs-actions:
+    status: exempt
+    comment: Действий нет.
+  docs-conditions:
+    status: exempt
+    comment: Условий нет.
+  docs-high-level-description: done
+  docs-installation-instructions: done
+  docs-removal-instructions: done
+  docs-triggers:
+    status: exempt
+    comment: Триггеров нет.
+  entity-event-setup:
+    status: exempt
+    comment: Сущностей нет.
+  entity-unique-id:
+    status: exempt
+    comment: Сущностей нет.
+  has-entity-name:
+    status: exempt
+    comment: Сущностей нет.
+  runtime-data: done
+  test-before-configure: done
+  test-before-setup: done
+  unique-config-entry:
+    status: exempt
+    comment: Тот же ассистент допустим в нескольких записях. Уникальность даёт entry_id.
+  # Silver
+  action-exceptions:
+    status: exempt
+    comment: Действий нет.
+  config-entry-unloading: done
+  docs-configuration-parameters: done
+  docs-installation-parameters: done
+  entity-unavailable:
+    status: exempt
+    comment: Сущностей нет.
+  integration-owner: done
+  log-when-unavailable: done
+  parallel-updates:
+    status: exempt
+    comment: Сущностей нет.
+  reauthentication-flow:
+    status: exempt
+    comment: Токен живёт на колонке, а не в записи интеграции.
+  test-coverage: done
+  # Gold
+  devices:
+    status: exempt
+    comment: Устройств нет.
+  diagnostics: done
+  discovery:
+    status: exempt
+    comment: В сети нечего обнаруживать.
+  discovery-update-info:
+    status: exempt
+    comment: Обнаружения нет.
+  docs-data-update:
+    status: exempt
+    comment: Опроса нет, описывать обновление данных нечего.
+  docs-examples: done
+  docs-known-limitations: done
+  docs-supported-devices:
+    status: exempt
+    comment: Устройств нет, описывать нечего.
+  docs-supported-functions: done
+  docs-troubleshooting: done
+  docs-use-cases: done
+  dynamic-devices:
+    status: exempt
+    comment: Устройств нет.
+  entity-category:
+    status: exempt
+    comment: Сущностей нет.
+  entity-device-class:
+    status: exempt
+    comment: Сущностей нет.
+  entity-disabled-by-default:
+    status: exempt
+    comment: Сущностей нет.
+  entity-translations:
+    status: exempt
+    comment: Сущностей нет.
+  exception-translations: done
+  icon-translations:
+    status: exempt
+    comment: Сущностей нет.
+  reconfiguration-flow: done
+  repair-issues: done
+  stale-devices:
+    status: exempt
+    comment: Устройств нет.
+  # Platinum
+  async-dependency:
+    status: exempt
+    comment: Внешней библиотеки нет.
+  inject-websession:
+    status: exempt
+    comment: Исходящих запросов нет.
+  strict-typing: done
