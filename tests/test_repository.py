@@ -119,8 +119,12 @@ def test_manifest_and_hacs() -> None:
     ]
     assert manifest["domain"] == "quasar_assist"
     assert manifest["name"] == "Quasar Assist"
-    assert manifest["version"] == "0.1.0"
+    assert manifest["version"] == "0.2.0"
     assert manifest["config_flow"] is True
+    assert manifest["dependencies"] == ["assist_pipeline"]
+    assert manifest["documentation"] == (
+        "https://github.com/svdaru/quasar-assist/blob/master/README.md"
+    )
     assert manifest["iot_class"] == "local_push"
     assert manifest["codeowners"] == ["@svdaru"]
     assert manifest["documentation"].endswith("/README.md")
@@ -151,18 +155,28 @@ def test_readme_translations_and_icons() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for snippet in README_SNIPPETS:
         assert snippet in readme
+    assert "README.ru.md" in readme
+    assert "pipeline" in readme.lower()
+    russian = (ROOT / "README.ru.md").read_text(encoding="utf-8")
+    assert "конвейер" in russian
+    assert "90" in russian
+    assert "/api/quasar_assist/v1/models" in russian
+    assert "/api/quasar_assist/v1/responses" in russian
+    assert "agent_id" not in readme
+    assert "agent_id" not in russian
     assert not (PACKAGE / "strings.json").exists()
     for language in ("en", "ru"):
         translated = json.loads(
             (PACKAGE / "translations" / f"{language}.json").read_text(encoding="utf-8")
         )
         errors = translated["config"]["error"]
-        assert "assistant_not_found" in errors
+        assert "pipeline_not_found" in errors
         assert "invalid_ttl" in errors
-        assert "no_assistants" in translated["config"]["abort"]
-        assert "assistant_unavailable" in translated["issues"]
-        exception = translated["exceptions"]["assistant_unavailable"]
+        assert "no_pipelines" in translated["config"]["abort"]
+        assert "pipeline_unavailable" in translated["issues"]
+        exception = translated["exceptions"]["pipeline_unavailable"]
         assert "{entry_id}" in exception["message"]
+        assert "agent_id" not in json.dumps(translated)
     assert _png_size(PACKAGE / "brand" / "icon.png") == (256, 256)
     assert _png_size(PACKAGE / "brand" / "icon@2x.png") == (512, 512)
 
@@ -227,7 +241,34 @@ def test_production_style_and_no_outbound_model() -> None:
     }
     assert "post" in methods
     assert "get" in methods
-    assert "async_call_assist" in methods
+    pipeline_tree = ast.parse((PACKAGE / "pipeline.py").read_text(encoding="utf-8"))
+    pipeline_names = {
+        node.name
+        for node in ast.walk(pipeline_tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+    }
+    assert "async_run_pipeline" in pipeline_names
+    assert not (PACKAGE / "agent.py").exists()
+
+
+def test_package_has_no_saved_agent_field() -> None:
+    """В дереве компонента нет выбора агента диалога и сохранённого поля."""
+    forbidden = (
+        "agent_id",
+        "async_converse",
+        "async_get_agent",
+        "async_list_agents",
+        "HOME_ASSISTANT_AGENT",
+        "voice assistant",
+        "голосового ассистента",
+        "голосовой ассистент",
+    )
+    for path in PACKAGE.rglob("*"):
+        if path.suffix not in {".py", ".json", ".yaml", ".yml", ".md"}:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in text, f"{path.name} содержит {token}"
 
 
 def _names_exception(node: ast.expr) -> bool:

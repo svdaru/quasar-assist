@@ -1,4 +1,4 @@
-"""Настройка записи: голосовой ассистент и срок диалога."""
+"""Настройка записи: конвейер Assist и срок диалога."""
 
 from typing import Any, cast
 
@@ -15,16 +15,17 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 
-from .agent import agent_is_available, async_list_agents
 from .const import (
-    ABORT_NO_ASSISTANTS,
-    CONF_AGENT_ID,
+    ABORT_NO_PIPELINES,
     CONF_CONVERSATION_TTL,
+    CONF_PIPELINE_ID,
     DEFAULT_CONVERSATION_TTL,
     DOMAIN,
-    ERROR_ASSISTANT_NOT_FOUND,
     ERROR_INVALID_TTL,
+    ERROR_PIPELINE_NOT_FOUND,
 )
+from .pipeline import list_pipelines, pipeline_is_available
+from .runtime import delete_legacy_issue
 
 
 def parse_ttl(value: object) -> int | None:
@@ -39,18 +40,27 @@ def parse_ttl(value: object) -> int | None:
     return ttl
 
 
-def _schema(agents: dict[str, str]) -> probatio.Schema:
-    """Схема шага: выбор из списка, без свободного ввода agent_id."""
+def pipeline_title(pipeline_id: str, pipelines: dict[str, str]) -> str:
+    """Название записи: имя конвейера, а если оно пустое — его идентификатор."""
+    name = pipelines.get(pipeline_id, "")
+    if name != "":
+        return name
+    return pipeline_id
+
+
+def _schema(pipelines: dict[str, str]) -> probatio.Schema:
+    """Схема шага: выбор из списка, без свободного ввода идентификатора."""
     options: list[SelectOptionDict] = [
-        {"value": agent_id, "label": name} for agent_id, name in agents.items()
+        {"value": pipeline_id, "label": name} for pipeline_id, name in pipelines.items()
     ]
     return probatio.Schema(
         {
-            probatio.Required(CONF_AGENT_ID): SelectSelector(
+            probatio.Required(CONF_PIPELINE_ID): SelectSelector(
                 SelectSelectorConfig(
                     options=options,
                     mode=SelectSelectorMode.DROPDOWN,
                     custom_value=False,
+                    sort=False,
                 )
             ),
             probatio.Required(
@@ -75,66 +85,76 @@ class QuasarAssistConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Создать запись, только если ассистент выбран из настроенных."""
-        agents = async_list_agents(self.hass)
-        if not agents:
-            return self.async_abort(reason=ABORT_NO_ASSISTANTS)
+        """Создать запись, только если конвейер выбран из настроенных."""
+        pipelines = list_pipelines(self.hass)
+        if not pipelines:
+            return self.async_abort(reason=ABORT_NO_PIPELINES)
 
         errors: dict[str, str] = {}
         if user_input is not None:
-            checked = self._check(user_input, agents)
+            checked = self._check(user_input, pipelines)
             if isinstance(checked, dict):
                 errors = checked
             else:
-                agent_id, ttl = checked
+                pipeline_id, ttl = checked
                 return self.async_create_entry(
-                    title=agents.get(agent_id) or agent_id,
+                    title=pipeline_title(pipeline_id, pipelines),
                     data={
-                        CONF_AGENT_ID: agent_id,
+                        CONF_PIPELINE_ID: pipeline_id,
                         CONF_CONVERSATION_TTL: ttl,
                     },
                 )
 
         return self.async_show_form(
             step_id="user",
-            data_schema=_schema(agents),
+            data_schema=_schema(pipelines),
             errors=errors,
         )
 
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Сменить ассистента или срок, не удаляя запись."""
+        """Сменить конвейер или срок, не удаляя запись.
+
+        Данные заменяются целиком. После выбора в записи остаются только
+        идентификатор конвейера и срок, даже если раньше там был другой ключ.
+        """
         entry = self._get_reconfigure_entry()
-        agents = async_list_agents(self.hass)
-        if not agents:
-            return self.async_abort(reason=ABORT_NO_ASSISTANTS)
+        pipelines = list_pipelines(self.hass)
+        if not pipelines:
+            return self.async_abort(reason=ABORT_NO_PIPELINES)
 
         errors: dict[str, str] = {}
         if user_input is not None:
-            checked = self._check(user_input, agents)
+            checked = self._check(user_input, pipelines)
             if isinstance(checked, dict):
                 errors = checked
             else:
-                agent_id, ttl = checked
+                pipeline_id, ttl = checked
+                delete_legacy_issue(self.hass, entry.entry_id)
                 return self.async_update_reload_and_abort(
                     entry,
-                    data_updates={
-                        CONF_AGENT_ID: agent_id,
+                    title=pipeline_title(pipeline_id, pipelines),
+                    data={
+                        CONF_PIPELINE_ID: pipeline_id,
                         CONF_CONVERSATION_TTL: ttl,
                     },
                 )
 
-        suggested = {
-            CONF_AGENT_ID: entry.data.get(CONF_AGENT_ID),
+        suggested: dict[str, Any] = {
             CONF_CONVERSATION_TTL: entry.data.get(
                 CONF_CONVERSATION_TTL,
                 DEFAULT_CONVERSATION_TTL,
             ),
         }
+        current = entry.data.get(CONF_PIPELINE_ID)
+        if isinstance(current, str) and current in pipelines:
+            suggested[CONF_PIPELINE_ID] = current
         return self.async_show_form(
             step_id="reconfigure",
-            data_schema=self.add_suggested_values_to_schema(_schema(agents), suggested),
+            data_schema=self.add_suggested_values_to_schema(
+                _schema(pipelines), suggested
+            ),
             errors=errors,
         )
 
@@ -142,17 +162,19 @@ class QuasarAssistConfigFlow(ConfigFlow, domain=DOMAIN):
     def _check(
         self,
         user_input: dict[str, Any],
-        agents: dict[str, str],
+        pipelines: dict[str, str],
     ) -> dict[str, str] | tuple[str, int]:
-        """Проверить ассистента и срок до создания или обновления записи."""
-        raw_agent = user_input.get(CONF_AGENT_ID)
-        agent_id = raw_agent if isinstance(raw_agent, str) else ""
+        """Проверить конвейер и срок до создания или обновления записи."""
+        raw_pipeline = user_input.get(CONF_PIPELINE_ID)
+        pipeline_id = raw_pipeline if isinstance(raw_pipeline, str) else ""
         errors: dict[str, str] = {}
-        if agent_id not in agents or not agent_is_available(self.hass, agent_id):
-            errors[CONF_AGENT_ID] = ERROR_ASSISTANT_NOT_FOUND
+        if pipeline_id not in pipelines or not pipeline_is_available(
+            self.hass, pipeline_id
+        ):
+            errors[CONF_PIPELINE_ID] = ERROR_PIPELINE_NOT_FOUND
         ttl = parse_ttl(user_input.get(CONF_CONVERSATION_TTL))
         if ttl is None:
             errors[CONF_CONVERSATION_TTL] = ERROR_INVALID_TTL
         if errors:
             return errors
-        return agent_id, cast(int, ttl)
+        return pipeline_id, cast(int, ttl)

@@ -41,7 +41,7 @@ rules:
   test-before-setup: done
   unique-config-entry:
     status: exempt
-    comment: Тот же ассистент допустим в нескольких записях. Уникальность даёт entry_id.
+    comment: Тот же конвейер допустим в нескольких записях. Уникальность даёт entry_id.
   # Silver
   action-exceptions:
     status: exempt

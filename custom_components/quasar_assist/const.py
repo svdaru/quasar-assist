@@ -2,7 +2,7 @@
 
 DOMAIN = "quasar_assist"
 
-CONF_AGENT_ID = "agent_id"
+CONF_PIPELINE_ID = "pipeline_id"
 CONF_CONVERSATION_TTL = "conversation_ttl"
 DEFAULT_CONVERSATION_TTL = 90
 
@@ -17,8 +17,10 @@ PHRASE_NOT_FOUND = "Запись не найдена"
 PHRASE_EMPTY = "Пустая фраза"
 PHRASE_FAILED = "Не удалось выполнить"
 
-ERROR_ASSISTANT_NOT_FOUND = "assistant_not_found"
+ERROR_PIPELINE_NOT_FOUND = "pipeline_not_found"
 ERROR_INVALID_TTL = "invalid_ttl"
-ABORT_NO_ASSISTANTS = "no_assistants"
+ABORT_NO_PIPELINES = "no_pipelines"
 
-ISSUE_ASSISTANT_UNAVAILABLE = "assistant_unavailable"
+ISSUE_PIPELINE_UNAVAILABLE = "pipeline_unavailable"
+# Идентификатор repair версии 0.1.0. Новый код его только снимает.
+LEGACY_ISSUE_ASSISTANT_UNAVAILABLE = "assistant_unavailable"

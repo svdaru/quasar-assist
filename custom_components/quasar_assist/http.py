@@ -1,15 +1,11 @@
 """HTTP-адреса Responses и списка записей."""
 
-import asyncio
 import json
-import logging
 from dataclasses import dataclass
 from typing import Any, cast
 
 from aiohttp import web
 from homeassistant.auth.models import User
-from homeassistant.components import conversation
-from homeassistant.components.conversation import ConversationResult
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.helpers.http import HomeAssistantView
@@ -25,25 +21,17 @@ from .const import (
     RESPONSES_URL,
     RESPONSES_VIEW_NAME,
 )
+from .pipeline import async_run_pipeline
 from .runtime import (
     QuasarAssistRuntimeData,
-    agent_id_of,
     close_dialogue,
     conversation_ttl,
+    hold_chat_session,
     live_conversation_id,
-    refresh_assistant,
+    pipeline_id_of,
+    refresh_pipeline,
     remember_success,
     utcnow,
-)
-
-_LOGGER = logging.getLogger(__name__)
-
-# Отмена задачи и останов интерпретатора не становятся фразой о неудаче.
-_PASSTHROUGH_FAILURES = (
-    KeyboardInterrupt,
-    SystemExit,
-    GeneratorExit,
-    asyncio.CancelledError,
 )
 
 _MISSING = object()
@@ -116,20 +104,6 @@ async def async_load_json_body(request: web.Request) -> object:
     return parsed
 
 
-def plain_speech(result: ConversationResult) -> str:
-    """Достать response.speech.plain.speech. Пусто, если речи нет."""
-    speech = result.response.speech
-    if not isinstance(speech, dict):
-        return ""
-    plain = speech.get("plain")
-    if not isinstance(plain, dict):
-        return ""
-    text = plain.get("speech")
-    if not isinstance(text, str):
-        return ""
-    return text
-
-
 def completed_body(text: str) -> dict[str, Any]:
     """Ответ мосту: завершённое сообщение без вызова инструментов."""
     return {
@@ -165,42 +139,12 @@ def find_entry(hass: HomeAssistant, model: str) -> ConfigEntry | None:
     return entry
 
 
-async def async_call_assist(
-    hass: HomeAssistant,
-    text: str,
-    conversation_id: str | None,
-    context: Context,
-    agent_id: str,
-) -> ConversationResult | None:
-    """Вызвать Assist. None — вызов завершился исключением.
-
-    Язык не передаётся. Системный текст, история и tools сюда не входят.
-    Текст исключения в журнал не пишется: в нём может быть реплика.
-    """
-    try:
-        return await conversation.async_converse(
-            hass,
-            text,
-            conversation_id,
-            context,
-            agent_id=agent_id,
-        )
-    except BaseException as err:
-        if isinstance(err, _PASSTHROUGH_FAILURES):
-            raise
-        _LOGGER.debug(
-            "Вызов Assist завершился ошибкой %s",
-            type(err).__name__,
-        )
-        return None
-
-
 def model_rows(hass: HomeAssistant) -> list[dict[str, str]]:
     """Собрать модели из config entries, по возрастанию id."""
     rows: list[dict[str, str]] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
         title = entry.title
-        name = title if isinstance(title, str) and title != "" else entry.entry_id
+        name = title if title != "" else entry.entry_id
         rows.append({"id": entry.entry_id, "name": name})
     rows.sort(key=lambda row: row["id"])
     return rows
@@ -214,7 +158,15 @@ class ResponsesView(HomeAssistantView):
     requires_auth = True
 
     async def post(self, request: web.Request) -> web.Response:
-        """Принять Responses и вернуть речь Assist либо короткую фразу."""
+        """Принять Responses и вернуть речь конвейера либо короткую фразу.
+
+        Порядок один: чужая форма, неизвестная запись, пустая фраза,
+        затем неудачный старт и один запуск. Эти три отказа замок не
+        берут и живой диалог не меняют. Дальше замок записи держится
+        от проверки конвейера до remember_success или close_dialogue,
+        включая ожидание запуска и удержание сессии. Заголовок
+        авторизации здесь не читается.
+        """
         try:
             body = await async_load_json_body(request)
         except ValueError:
@@ -235,33 +187,33 @@ class ResponsesView(HomeAssistantView):
             return self.json(completed_body(PHRASE_EMPTY))
 
         runtime = runtime_of(entry)
-        if runtime is None or not refresh_assistant(hass, entry):
-            if runtime is not None:
+        if runtime is None:
+            return self.json(completed_body(PHRASE_FAILED))
+
+        # Замок лежит на runtime записи и держится до выхода из блока.
+        async with runtime.request_lock:
+            if not refresh_pipeline(hass, entry):
                 close_dialogue(runtime)
-            return self.json(completed_body(PHRASE_FAILED))
+                return self.json(completed_body(PHRASE_FAILED))
 
-        context = Context(user_id=user.id)
-        conversation_id = live_conversation_id(
-            runtime, conversation_ttl(entry), utcnow()
-        )
-        result = await async_call_assist(
-            hass,
-            parsed.text,
-            conversation_id,
-            context,
-            agent_id_of(entry),
-        )
-        if result is None:
-            close_dialogue(runtime)
-            return self.json(completed_body(PHRASE_FAILED))
+            context = Context(user_id=user.id)
+            conversation_id = live_conversation_id(
+                runtime, conversation_ttl(entry), utcnow()
+            )
+            reply = await async_run_pipeline(
+                hass,
+                parsed.text,
+                conversation_id,
+                context,
+                pipeline_id_of(entry),
+            )
+            if reply is None or reply.speech == "":
+                close_dialogue(runtime)
+                return self.json(completed_body(PHRASE_FAILED))
 
-        speech = plain_speech(result)
-        if speech == "":
-            close_dialogue(runtime)
-            return self.json(completed_body(PHRASE_FAILED))
-
-        remember_success(runtime, result.conversation_id, utcnow())
-        return self.json(completed_body(speech))
+            remember_success(runtime, reply.conversation_id, utcnow())
+            hold_chat_session(hass, entry)
+            return self.json(completed_body(reply.speech))
 
 
 class ModelsView(HomeAssistantView):
@@ -272,6 +224,6 @@ class ModelsView(HomeAssistantView):
     requires_auth = True
 
     async def get(self, request: web.Request) -> web.Response:
-        """Отдать записи домена. Assist не вызывается, таймеры не меняются."""
+        """Отдать записи домена. Конвейер не запускается, таймеры не меняются."""
         hass = cast(HomeAssistant, request.app["hass"])
         return self.json({"data": model_rows(hass)})

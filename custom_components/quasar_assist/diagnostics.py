@@ -5,7 +5,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_AGENT_ID, CONF_CONVERSATION_TTL
+from .const import CONF_CONVERSATION_TTL, CONF_PIPELINE_ID
 from .runtime import QuasarAssistRuntimeData
 
 
@@ -19,15 +19,15 @@ async def async_get_config_entry_diagnostics(
     """
     runtime = getattr(entry, "runtime_data", None)
     dialogue_open = False
-    assistant_unavailable = False
+    pipeline_unavailable = False
     if isinstance(runtime, QuasarAssistRuntimeData):
         dialogue_open = runtime.conversation_id is not None
-        assistant_unavailable = runtime.assistant_unavailable
+        pipeline_unavailable = runtime.pipeline_unavailable
     return {
         "entry_id": entry.entry_id,
         "title": entry.title,
-        "agent_id": entry.data.get(CONF_AGENT_ID),
+        "pipeline_id": entry.data.get(CONF_PIPELINE_ID),
         "conversation_ttl": entry.data.get(CONF_CONVERSATION_TTL),
         "dialogue_open": dialogue_open,
-        "assistant_unavailable": assistant_unavailable,
+        "pipeline_unavailable": pipeline_unavailable,
     }

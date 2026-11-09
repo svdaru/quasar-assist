@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 from homeassistant.components import conversation
+from homeassistant.components.assist_pipeline.pipeline import PipelineInput
+from homeassistant.components.assist_pipeline.runtime import KEY_ASSIST_PIPELINE
 from homeassistant.components.conversation.models import (
     AbstractConversationAgent,
     ConversationInput,
@@ -14,15 +16,16 @@ from homeassistant.components.conversation.models import (
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import intent
+from homeassistant.helpers.chat_session import async_get_chat_session
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.quasar_assist.agent import agent_is_available
 from custom_components.quasar_assist.const import (
-    CONF_AGENT_ID,
     CONF_CONVERSATION_TTL,
+    CONF_PIPELINE_ID,
     DOMAIN,
 )
+from custom_components.quasar_assist.pipeline import pipeline_is_available
 
 
 class Clock:
@@ -35,59 +38,47 @@ class Clock:
         return self.moment
 
 
-class StubAgent(AbstractConversationAgent):
-    """Ассистент, которого тест регистрирует вторым."""
-
-    @property
-    def supported_languages(self) -> list[str]:
-        return ["ru"]
-
-    async def async_process(self, user_input: ConversationInput) -> ConversationResult:
-        raise AssertionError("вызов должен идти через подмену async_converse")
-
-
-class ConverseMock:
-    """Подмена conversation.async_converse."""
+class SpeechEngine(AbstractConversationAgent):
+    """Движок конвейера: речь задаёт тест, сеть модели не нужна."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[Any, ...]] = []
+        self.calls: list[tuple[str, str | None, str | None]] = []
         self.speech = "Включила свет"
         self.error_type = False
         self.exc: BaseException | None = None
-        self.index = 0
 
-    async def __call__(
-        self,
-        hass: HomeAssistant,
-        text: str,
-        conversation_id: str | None,
-        context: object,
-        **kwargs: Any,
-    ) -> ConversationResult:
-        self.calls.append((text, conversation_id, context, kwargs))
+    @property
+    def supported_languages(self) -> list[str]:
+        return ["en", "ru"]
+
+    async def async_process(self, user_input: ConversationInput) -> ConversationResult:
+        self.calls.append(
+            (
+                user_input.text,
+                user_input.conversation_id,
+                user_input.extra_system_prompt,
+            )
+        )
         if self.exc is not None:
             raise self.exc
-        self.index += 1
-        return build_result(
-            self.speech,
-            f"conv-{self.index}",
-            error_type=self.error_type,
+        response = intent.IntentResponse(language=user_input.language)
+        if self.speech != "":
+            response.async_set_speech(self.speech)
+        if self.error_type:
+            response.response_type = intent.IntentResponseType.ERROR
+            response.error_code = intent.IntentResponseErrorCode.NO_INTENT_MATCH
+        return ConversationResult(
+            response=response,
+            conversation_id=user_input.conversation_id,
         )
 
 
-def build_result(
-    speech: str,
-    conversation_id: str | None,
-    *,
-    error_type: bool = False,
-) -> ConversationResult:
-    """Собрать результат Assist с речью plain.speech."""
-    response = intent.IntentResponse(language="ru")
-    if speech != "":
-        response.async_set_speech(speech)
-    if error_type:
-        response.response_type = intent.IntentResponseType.ERROR
-    return ConversationResult(response=response, conversation_id=conversation_id)
+class PipelineCapture:
+    """Запуски PipelineInput, которые увидел тест."""
+
+    def __init__(self) -> None:
+        self.inputs: list[PipelineInput] = []
+        self.events: list[list[Any]] = []
 
 
 def responses_body(
@@ -143,7 +134,8 @@ def responses_body(
         "tools": [],
         "text": {"format": {"type": "json_object"}},
         "conversation_id": "from-client",
-        "agent_id": "from-client",
+        "pipeline_id": "from-client",
+        "language": "de",
         "input": items,
     }
 
@@ -162,20 +154,54 @@ def assert_completed(payload: dict[str, Any], text: str) -> None:
     assert "function_call" not in dumped
 
 
-async def async_prepare_conversation(hass: HomeAssistant) -> None:
-    """Поднять ядро и диалог, без которых Assist в тесте не стартует."""
+def intent_speech(events: list[Any]) -> str:
+    """Речь единственного события intent-end."""
+    speeches = [
+        event.data["intent_output"]["response"]["speech"]["plain"]["speech"]
+        for event in events
+        if getattr(event, "type", None) == "intent-end" and isinstance(event.data, dict)
+    ]
+    assert len(speeches) == 1
+    assert isinstance(speeches[0], str)
+    return speeches[0]
+
+
+async def async_prepare_assist(hass: HomeAssistant) -> None:
+    """Поднять ядро и конвейер Assist без живой колонки."""
     assert await async_setup_component(hass, "homeassistant", {})
-    assert await async_setup_component(hass, "conversation", {})
+    assert await async_setup_component(hass, "assist_pipeline", {})
     await hass.async_block_till_done()
 
 
-async def async_register_agent(hass: HomeAssistant, title: str) -> str:
-    """Зарегистрировать второго ассистента и вернуть его id."""
-    await async_prepare_conversation(hass)
-    holder = MockConfigEntry(domain="openai_conversation", title=title)
+async def async_create_pipeline(
+    hass: HomeAssistant,
+    name: str,
+    engine: SpeechEngine | None = None,
+) -> tuple[str, SpeechEngine]:
+    """Создать конвейер с локальным движком речи и вернуть его id."""
+    await async_prepare_assist(hass)
+    if engine is None:
+        engine = SpeechEngine()
+    holder = MockConfigEntry(domain="pipeline_engine_test", title=name)
     holder.add_to_hass(hass)
-    conversation.async_set_agent(hass, holder, StubAgent())
-    return str(holder.entry_id)
+    conversation.async_set_agent(hass, holder, engine)
+    created = await hass.data[KEY_ASSIST_PIPELINE].pipeline_store.async_create_item(
+        {
+            "conversation_engine": holder.entry_id,
+            "conversation_language": "en",
+            "language": "en",
+            "name": name,
+            "stt_engine": None,
+            "stt_language": None,
+            "tts_engine": None,
+            "tts_language": None,
+            "tts_voice": None,
+            "wake_word_entity": None,
+            "wake_word_id": None,
+            "prefer_local_intents": False,
+        }
+    )
+    return created.id, engine
 
 
 def assert_same_entry(found: ConfigEntry | None, entry: MockConfigEntry) -> None:
@@ -189,26 +215,26 @@ def assert_same_entry(found: ConfigEntry | None, entry: MockConfigEntry) -> None
 
 async def async_add_entry(
     hass: HomeAssistant,
-    agent_id: str,
+    pipeline_id: str,
     *,
     ttl: int = 90,
     title: str = "Спальня",
     entry_id: str | None = None,
 ) -> MockConfigEntry:
-    """Добавить запись quasar_assist в реестр и запустить её.
+    """Добавить запись quasar_assist и запустить её.
 
-    Живой ассистент загружает запись. Пропавший оставляет её в реестре
+    Живой конвейер загружает запись. Пропавший оставляет её в реестре
     в состоянии SETUP_ERROR: повтор сам её не поднимет.
     """
-    await async_prepare_conversation(hass)
+    await async_prepare_assist(hass)
     entry = MockConfigEntry(
         domain=DOMAIN,
         title=title,
-        data={CONF_AGENT_ID: agent_id, CONF_CONVERSATION_TTL: ttl},
+        data={CONF_PIPELINE_ID: pipeline_id, CONF_CONVERSATION_TTL: ttl},
         entry_id=entry_id,
     )
     entry.add_to_hass(hass)
-    available = agent_is_available(hass, agent_id)
+    available = pipeline_is_available(hass, pipeline_id)
     await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     assert_same_entry(hass.config_entries.async_get_entry(entry.entry_id), entry)
@@ -219,21 +245,51 @@ async def async_add_entry(
     return entry
 
 
-def patch_converse(
-    monkeypatch: pytest.MonkeyPatch,
-    mock: ConverseMock,
-) -> None:
-    """Подменить вызов Assist в обработчике."""
+def patch_execute(monkeypatch: pytest.MonkeyPatch, capture: PipelineCapture) -> None:
+    """Запомнить каждый PipelineInput и события его запуска."""
+    original = PipelineInput.execute
+
+    async def wrapped(self: PipelineInput, validate: bool = False) -> None:
+        capture.inputs.append(self)
+        events: list[Any] = []
+        original_callback = self.run.event_callback
+
+        def spy(event: Any) -> None:
+            events.append(event)
+            original_callback(event)
+
+        self.run.event_callback = spy
+        capture.events.append(events)
+        await original(self, validate=validate)
+
+    monkeypatch.setattr(PipelineInput, "execute", wrapped)
+
+
+def patch_session_ids(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
+    """Запомнить идентификаторы диалога, которые запись передала в сессию."""
+    recorded: list[str | None] = []
+    original = async_get_chat_session
+
+    def wrapped(hass: HomeAssistant, conversation_id: str | None = None) -> Any:
+        recorded.append(conversation_id)
+        return original(hass, conversation_id)
+
     monkeypatch.setattr(
-        "custom_components.quasar_assist.http.conversation.async_converse",
-        mock,
+        "custom_components.quasar_assist.pipeline.async_get_chat_session",
+        wrapped,
     )
+    return recorded
 
 
 def patch_clock(monkeypatch: pytest.MonkeyPatch, clock: Clock) -> None:
     """Подменить часы обработчика и состояния."""
     monkeypatch.setattr("custom_components.quasar_assist.http.utcnow", clock)
     monkeypatch.setattr("custom_components.quasar_assist.runtime.utcnow", clock)
+
+
+async def async_delete_pipeline(hass: HomeAssistant, pipeline_id: str) -> None:
+    """Удалить конвейер из хранилища Assist."""
+    await hass.data[KEY_ASSIST_PIPELINE].pipeline_store.async_delete_item(pipeline_id)
 
 
 ClientFactory = Callable[..., Any]

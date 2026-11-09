@@ -6,3 +6,5 @@ pytest-cov==7.1.0
 gazetteer-matcher==1.1.0
 hassil==3.12.1
 home-assistant-intents==2026.10.6
+mutagen==1.48.1
+ha-ffmpeg==3.2.2
