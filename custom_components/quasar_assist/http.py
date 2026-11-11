@@ -1,6 +1,7 @@
 """HTTP-адреса Responses и списка записей."""
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -10,6 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.helpers.http import HomeAssistantView
 
+from .classify import match_route
 from .const import (
     DOMAIN,
     MAX_REQUEST_BODY_BYTES,
@@ -21,7 +23,7 @@ from .const import (
     RESPONSES_URL,
     RESPONSES_VIEW_NAME,
 )
-from .pipeline import async_run_pipeline
+from .pipeline import _PASSTHROUGH_FAILURES, async_run_pipeline
 from .runtime import (
     QuasarAssistRuntimeData,
     close_dialogue,
@@ -34,7 +36,56 @@ from .runtime import (
     utcnow,
 )
 
+_LOGGER = logging.getLogger(__name__)
+
 _MISSING = object()
+
+
+@dataclass(slots=True)
+class _TurnLog:
+    """Поля одной отладочной строки хода запроса.
+
+    Реплика пишется, только если строка прошла проверку формы. Речь —
+    только если конвейер её вернул. Маршрут — литерал llm или yandex.
+    Текст исключения сюда не входит, только имя типа.
+    """
+
+    phrase: str | None = None
+    speech: str | None = None
+    route: str | None = None
+    error_type: str | None = None
+
+    def write(self) -> None:
+        """Записать одну строку DEBUG. Тело, история и системный текст не входят."""
+        _LOGGER.debug(
+            "Ход запроса реплика=%s речь=%s маршрут=%s сбой=%s",
+            "" if self.phrase is None else self.phrase,
+            "" if self.speech is None else self.speech,
+            "" if self.route is None else self.route,
+            "" if self.error_type is None else self.error_type,
+        )
+
+
+def classify_branch(body: dict[str, Any]) -> bool:
+    """Ветка включена, только если первое system — строка ровно classify.
+
+    Пробелы вокруг, другая строка и нестроковое содержание ветку не включают.
+    Более позднее system не смотрится, если первое уже найдено. Нестроковое
+    system само по себе не делает тело чужой формой.
+    """
+    raw_input = body.get("input")
+    if not isinstance(raw_input, list):
+        return False
+    for item in raw_input:
+        if not isinstance(item, dict) or item.get("role") != "system":
+            continue
+        return item.get("content") == "classify"
+    return False
+
+
+def empty_failure() -> web.Response:
+    """Пустой HTTP 500 без JSON: маршрут выбирает on_error колонки."""
+    return web.Response(status=500, body=b"")
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,33 +209,49 @@ class ResponsesView(HomeAssistantView):
     requires_auth = True
 
     async def post(self, request: web.Request) -> web.Response:
-        """Принять Responses и вернуть речь конвейера либо короткую фразу.
+        """Принять Responses и вернуть речь, маршрут или короткую фразу.
 
         Порядок один: чужая форма, неизвестная запись, пустая фраза,
-        затем неудачный старт и один запуск. Эти три отказа замок не
-        берут и живой диалог не меняют. Дальше замок записи держится
-        от проверки конвейера до remember_success или close_dialogue,
-        включая ожидание запуска и удержание сессии. Заголовок
-        авторизации здесь не читается.
+        затем ветка маршрута или прежний конвейер. Ветка не берёт замок
+        и не зависит от конвейера. Без неё замок держится от проверки
+        конвейера до remember_success или close_dialogue. На запрос
+        одна отладочная строка. Заголовок авторизации здесь не читается.
         """
+        turn = _TurnLog()
+        try:
+            return await self._complete(request, turn)
+        finally:
+            turn.write()
+
+    async def _complete(self, request: web.Request, turn: _TurnLog) -> web.Response:
+        """Пройти порядок отказов и вернуть ответ. Журнал пишет post."""
         try:
             body = await async_load_json_body(request)
         except ValueError:
             return self.json({"error": "invalid_request"}, status_code=400)
 
+        parsed = parse_body(body)
+        if parsed is None or not isinstance(body, dict):
+            return self.json({"error": "invalid_request"}, status_code=400)
+        text = parsed.text
+        if isinstance(text, str):
+            turn.phrase = text
+
         hass = cast(HomeAssistant, request.app["hass"])
         user = cast(User, request["hass_user"])
-
-        parsed = parse_body(body)
-        if parsed is None:
-            return self.json({"error": "invalid_request"}, status_code=400)
+        branch = classify_branch(body)
 
         entry = find_entry(hass, parsed.model)
         if entry is None:
             return self.json(completed_body(PHRASE_NOT_FOUND))
 
-        if parsed.text is None or parsed.text == "":
+        if text is None or text == "":
+            if branch:
+                return empty_failure()
             return self.json(completed_body(PHRASE_EMPTY))
+
+        if branch:
+            return self._route(hass, text, turn)
 
         runtime = runtime_of(entry)
         if runtime is None:
@@ -202,18 +269,39 @@ class ResponsesView(HomeAssistantView):
             )
             reply = await async_run_pipeline(
                 hass,
-                parsed.text,
+                text,
                 conversation_id,
                 context,
                 pipeline_id_of(entry),
             )
             if reply is None or reply.speech == "":
+                if reply is not None and reply.error_type is not None:
+                    turn.error_type = reply.error_type
                 close_dialogue(runtime)
                 return self.json(completed_body(PHRASE_FAILED))
 
+            turn.speech = reply.speech
             remember_success(runtime, reply.conversation_id, utcnow())
             hold_chat_session(hass, entry)
             return self.json(completed_body(reply.speech))
+
+    def _route(self, hass: HomeAssistant, text: str, turn: _TurnLog) -> web.Response:
+        """Вернуть JSON маршрута. Сбой перечисления или распознавателя — пустой 500.
+
+        Конвейер, замок и таймер диалога здесь не используются. Отмена
+        задачи и останов интерпретатора не становятся пустым 500.
+        """
+        try:
+            route = match_route(hass, text)
+        except BaseException as err:
+            if isinstance(err, _PASSTHROUGH_FAILURES):
+                raise
+            turn.error_type = type(err).__name__
+            return empty_failure()
+        turn.route = route
+        return self.json(
+            completed_body(json.dumps({"route": route}, ensure_ascii=False))
+        )
 
 
 class ModelsView(HomeAssistantView):

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable, Collection
 from datetime import datetime, timedelta
 from typing import Any
@@ -290,6 +291,16 @@ def _own_log(caplog: pytest.LogCaptureFixture) -> str:
     )
 
 
+def _own_log_above_debug(caplog: pytest.LogCaptureFixture) -> str:
+    """Журнал интеграции выше отладки. Реплика туда не входит."""
+    return "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("custom_components.quasar_assist")
+        and record.levelno > logging.DEBUG
+    )
+
+
 async def test_same_entry_posts_do_not_overlap_pipeline(
     hass: HomeAssistant,
     hass_client: Any,
@@ -463,8 +474,9 @@ async def test_same_entry_posts_do_not_overlap_pipeline(
     assert entry.runtime_data.last_success is None
     assert entry.runtime_data.session_hold_unsub is None
     own = _own_log(caplog)
-    assert success_text not in own
-    assert failure_text not in own
+    above = _own_log_above_debug(caplog)
+    assert success_text not in above
+    assert failure_text not in above
     assert hass_access_token not in own
 
 
@@ -554,8 +566,9 @@ async def test_two_entries_run_pipeline_at_the_same_time(
     assert kitchen.runtime_data.conversation_id is not None
     assert bedroom.runtime_data.conversation_id != kitchen.runtime_data.conversation_id
     own = _own_log(caplog)
-    assert bedroom_text not in own
-    assert kitchen_text not in own
+    above = _own_log_above_debug(caplog)
+    assert bedroom_text not in above
+    assert kitchen_text not in above
     assert hass_access_token not in own
 
 
@@ -674,13 +687,9 @@ async def test_same_session_survives_assist_timeout_while_entry_timer_lives(
     assert engine.calls[0][1] == conversation_id
     assert engine.calls[1][1] == conversation_id
     assert entry.runtime_data.conversation_id == conversation_id
-    own = "\n".join(
-        record.getMessage()
-        for record in caplog.records
-        if record.name.startswith("custom_components.quasar_assist")
-    )
-    assert "включи свет" not in own
-    assert "А в спальне" not in own
+    above = _own_log_above_debug(caplog)
+    assert "включи свет" not in above
+    assert "А в спальне" not in above
 
 
 async def test_entry_timer_of_90_seconds_still_starts_a_new_dialogue(
@@ -1289,9 +1298,12 @@ async def test_logs_do_not_contain_phrase_or_token(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """QA-P-01: журнал интеграции не содержит токен и реплику."""
+    """QA-P-01: реплика только в одной отладочной строке, токен нигде."""
     pipeline_id, engine = await async_create_pipeline(hass, "Спальня")
-    engine.exc = RuntimeError("секретная реплика")
+    phrase = "секретная реплика"
+    secret = "текст-исключения-не-для-журнала"
+    engine.exc = RuntimeError(secret)
+    engine.speech = "речь-которой-нет"
     patch_execute(monkeypatch, PipelineCapture())
     entry = await async_add_entry(hass, pipeline_id)
     client = await hass_client()
@@ -1299,14 +1311,27 @@ async def test_logs_do_not_contain_phrase_or_token(
     caplog.clear()
     await client.post(
         RESPONSES_URL,
-        json=responses_body(entry.entry_id, "секретная реплика", noise=False),
+        json=responses_body(entry.entry_id, phrase),
     )
-    own = "\n".join(
-        record.getMessage()
+    own_records = [
+        record
         for record in caplog.records
         if record.name.startswith("custom_components.quasar_assist")
-    )
-    assert "секретная реплика" not in own
+    ]
+    debug = [
+        record.getMessage() for record in own_records if record.levelno == logging.DEBUG
+    ]
+    higher = [
+        record.getMessage() for record in own_records if record.levelno > logging.DEBUG
+    ]
+    own = "\n".join(record.getMessage() for record in own_records)
+    assert len(debug) == 1
+    assert phrase in debug[0]
+    assert secret not in own
+    assert "старая реплика" not in own
+    assert "Инструкции инструментов моста" not in own
+    assert "речь-которой-нет" not in own
+    assert phrase not in "\n".join(higher)
     assert hass_access_token not in own
     assert "Bearer" not in own
     assert "authorization" not in own.lower()

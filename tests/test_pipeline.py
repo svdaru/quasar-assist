@@ -1,18 +1,25 @@
 """Список конвейеров и края запуска."""
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
 from homeassistant.components.assist_pipeline.pipeline import PipelineInput
 from homeassistant.core import Context, HomeAssistant
 
+from custom_components.quasar_assist.const import PHRASE_FAILED, RESPONSES_URL
 from custom_components.quasar_assist.pipeline import (
     async_run_pipeline,
     list_pipelines,
     pipeline_is_available,
 )
-from tests.common import async_create_pipeline
+from tests.common import (
+    assert_completed,
+    async_add_entry,
+    async_create_pipeline,
+    responses_body,
+)
 
 
 async def test_list_before_component_is_loaded(hass: HomeAssistant) -> None:
@@ -72,31 +79,58 @@ async def test_run_reraises_cancellation(
 
 async def test_run_logs_exception_type_without_phrase(
     hass: HomeAssistant,
+    hass_client: Any,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Сбой запуска пишет только тип исключения, не текст реплики."""
+    """Сбой запуска: тип и реплика в одной строке хода, без текста исключения."""
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    entry = await async_add_entry(hass, pipeline_id)
+    phrase = "включи свет"
+    secret = "текст-исключения-запуска"
 
     async def broken(self: PipelineInput, validate: bool = False) -> None:
         del self, validate
-        raise RuntimeError("секретная реплика запуска")
+        raise RuntimeError(secret)
 
     monkeypatch.setattr(PipelineInput, "execute", broken)
     caplog.set_level("DEBUG", logger="custom_components.quasar_assist")
     caplog.clear()
-    assert (
-        await async_run_pipeline(hass, "включи свет", None, Context(), pipeline_id)
-        is None
-    )
-    own = "\n".join(
-        record.getMessage()
+    reply = await async_run_pipeline(hass, phrase, None, Context(), pipeline_id)
+    assert reply is not None
+    assert reply.error_type == "RuntimeError"
+    assert reply.speech == ""
+    assert not [
+        record
         for record in caplog.records
         if record.name.startswith("custom_components.quasar_assist")
+    ]
+
+    caplog.clear()
+    client = await hass_client()
+    response = await client.post(
+        RESPONSES_URL,
+        json=responses_body(entry.entry_id, phrase, noise=False),
     )
-    assert "RuntimeError" in own
-    assert "секретная реплика запуска" not in own
-    assert "включи свет" not in own
+    assert response.status == 200
+    assert_completed(await response.json(), PHRASE_FAILED)
+    own_records = [
+        record
+        for record in caplog.records
+        if record.name.startswith("custom_components.quasar_assist")
+    ]
+    debug = [
+        record.getMessage() for record in own_records if record.levelno == logging.DEBUG
+    ]
+    higher = "\n".join(
+        record.getMessage() for record in own_records if record.levelno > logging.DEBUG
+    )
+    own = "\n".join(record.getMessage() for record in own_records)
+    assert len(debug) == 1
+    assert "RuntimeError" in debug[0]
+    assert phrase in debug[0]
+    assert secret not in own
+    assert phrase not in higher
 
 
 async def test_run_reraises_keyboard_interrupt(

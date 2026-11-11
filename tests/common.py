@@ -177,6 +177,8 @@ async def async_create_pipeline(
     hass: HomeAssistant,
     name: str,
     engine: SpeechEngine | None = None,
+    *,
+    language: str = "en",
 ) -> tuple[str, SpeechEngine]:
     """Создать конвейер с локальным движком речи и вернуть его id."""
     await async_prepare_assist(hass)
@@ -188,8 +190,8 @@ async def async_create_pipeline(
     created = await hass.data[KEY_ASSIST_PIPELINE].pipeline_store.async_create_item(
         {
             "conversation_engine": holder.entry_id,
-            "conversation_language": "en",
-            "language": "en",
+            "conversation_language": language,
+            "language": language,
             "name": name,
             "stt_engine": None,
             "stt_language": None,

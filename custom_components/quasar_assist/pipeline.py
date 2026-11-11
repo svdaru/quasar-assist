@@ -1,7 +1,6 @@
 """Запуск конвейера Assist и список конвейеров по имени."""
 
 import asyncio
-import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,8 +19,6 @@ from homeassistant.components.assist_pipeline.pipeline import (
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.helpers.chat_session import async_get_chat_session
 
-_LOGGER = logging.getLogger(__name__)
-
 # Отмена задачи и останов интерпретатора не становятся фразой о неудаче.
 _PASSTHROUGH_FAILURES = (
     KeyboardInterrupt,
@@ -33,10 +30,15 @@ _PASSTHROUGH_FAILURES = (
 
 @dataclass(frozen=True, slots=True)
 class PipelineReply:
-    """Речь события intent-end и идентификатор диалога этой речи."""
+    """Речь события intent-end и идентификатор диалога этой речи.
+
+    error_type — имя типа исключения запуска. Текст исключения
+    никуда не кладётся: строка хода пишет только это имя.
+    """
 
     speech: str
     conversation_id: str | None
+    error_type: str | None = None
 
 
 def list_pipelines(hass: HomeAssistant) -> dict[str, str]:
@@ -120,9 +122,11 @@ async def async_run_pipeline(
     В PipelineInput уходит только текст фразы. Системный текст, история,
     tools, current_time и text.format сюда не копируются. Язык отдельно
     не передаётся, его берёт конвейер. Идентификатор диалога приходит
-    из таймера записи, не из тела запроса. None — конвейер не найден
-    или запуск завершился исключением. Текст исключения в журнал не
-    пишется: в нём может быть реплика.
+    из таймера записи, не из тела запроса. None — конвейер не найден.
+    Если запуск завершился исключением, речь пустая, а error_type —
+    имя типа. Текст исключения не пишется: в нём может быть реплика.
+    Журнал хода запроса ведёт вызывающий, чтобы на запрос была одна
+    отладочная строка.
     """
     try:
         pipeline = async_get_pipeline(hass, pipeline_id)
@@ -159,8 +163,8 @@ async def async_run_pipeline(
     except BaseException as err:
         if isinstance(err, _PASSTHROUGH_FAILURES):
             raise
-        _LOGGER.debug(
-            "Запуск конвейера завершился ошибкой %s",
-            type(err).__name__,
+        return PipelineReply(
+            speech="",
+            conversation_id=None,
+            error_type=type(err).__name__,
         )
-        return None

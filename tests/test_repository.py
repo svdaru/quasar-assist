@@ -119,7 +119,7 @@ def test_manifest_and_hacs() -> None:
     ]
     assert manifest["domain"] == "quasar_assist"
     assert manifest["name"] == "Quasar Assist"
-    assert manifest["version"] == "0.2.0"
+    assert manifest["version"] == "0.3.0"
     assert manifest["config_flow"] is True
     assert manifest["dependencies"] == ["assist_pipeline"]
     assert manifest["documentation"] == (
@@ -179,6 +179,34 @@ def test_readme_translations_and_icons() -> None:
         assert "agent_id" not in json.dumps(translated)
     assert _png_size(PACKAGE / "brand" / "icon.png") == (256, 256)
     assert _png_size(PACKAGE / "brand" / "icon@2x.png") == (512, 512)
+
+
+def test_readme_describes_classify_route() -> None:
+    """AC-13: оба README описывают маршрут, пустой 500 и отладочный журнал."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    russian = (ROOT / "README.ru.md").read_text(encoding="utf-8")
+    for text in (readme, russian):
+        assert "classify" in text
+        assert "llm" in text
+        assert "yandex" in text
+        assert "HTTP 500" in text
+        assert "quasar_assist" in text
+        assert "home" in text
+    assert "does not run the Assist pipeline" in readme
+    assert "empty body" in readme
+    assert "short phrase" in readme
+    assert "debug" in readme
+    assert "Settings" in readme
+    assert "System" in readme
+    assert "Logs" in readme
+    assert "без конвейера" in russian or "не запускает конвейер" in russian
+    assert "пустым телом" in russian
+    assert "короткая фраза" in russian
+    assert "ненайденная запись" in russian.lower() or "Ненайденная запись" in russian
+    assert "отладк" in russian
+    assert "Настройки" in russian
+    assert "Система" in russian
+    assert "Журналы" in russian
 
 
 def test_workflows_and_release_tag() -> None:

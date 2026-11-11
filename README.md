@@ -24,7 +24,7 @@ Quasar Assist does not create a second secret, does not store the token in the c
 
 The bridge setup below is not performed by this integration. Without it, the speaker will not send phrases.
 
-Quasar Bridge 0.7.5 has one model address for the `llm` route, the `home` scheduler, and the classifier. This integration sends every last user phrase to the selected Assist pipeline, so point only the phrases that should become Assist commands at this address.
+Quasar Bridge 0.7.5 has one model address for the `llm` route, the `home` scheduler, and the classifier. This integration sends every last user phrase to the selected Assist pipeline, so point only the phrases that should become Assist commands at this address. A phrase whose first system message is exactly `classify` does not go to the pipeline.
 
 - Base URL: `http://<home-assistant>:8123/api/quasar_assist/v1`
 - API type: `responses` (`llm_api` stays `responses`)
@@ -36,7 +36,7 @@ Routing example for the wake name used in this setup:
 
 - A rule `starts_with_any` of `львовна `, `львовна,`, `львовна.` sends the phrase to the `llm` route. The rule sees the phrase before the bridge strips a prefix.
 - Add `львовна` to `llm_strip_prefixes` together with the prefixes you already keep. A custom list replaces the standard list entirely and starts working after the bridge restarts. The bridge then sends only the remainder, for example `включи свет`.
-- While the bridge has a single model address, do not send the `home` scheduler, the classifier, or "ask the neural net" to this URL. Those need the previous model address.
+- A request whose first system message is exactly `classify` is answered here with the route `llm` or `yandex` and does not run the pipeline. This integration does not return the route `home`. While the bridge has a single model address, the home scheduler still needs the previous model address.
 
 ## Removal
 
@@ -112,6 +112,7 @@ A successful reply is HTTP 200. The speech is the plain text from the pipeline `
 - Keep a separate dialogue timer for each entry. The default lifetime is 90 seconds from the last successful reply, and each success extends it.
 - Reconfigure the pipeline and the lifetime without deleting the entry. The next call uses the new pipeline and starts a new dialogue.
 - Raise a repair when the selected pipeline disappears, and log the loss once and the recovery once. An older entry that has no pipeline id does not start until a pipeline is chosen again.
+- Answer a first system message of exactly `classify` with the route `llm` or `yandex` and do not run the pipeline. The route `home` is not returned.
 
 ## Use case
 
@@ -125,16 +126,26 @@ A person says "Алиса Львовна, включи свет". The speaker wa
 - Dialogue continuation is only the per-entry timer. Words such as "да", "нет", and a phrase that starts with "а " do not start or stop a dialogue by themselves.
 - The integration does not trim the last user phrase. If the bridge did not strip a prefix, the prefix is sent to the pipeline as received.
 - An empty `data` array is returned only when there are no entries. Quasar Bridge treats an empty model catalog as an error and will not let you pick a model.
-- The bridge has one model address. Do not point the `home` scheduler, the classifier, or "ask the neural net" at this integration.
+- The bridge has one model address. A system message `classify` is answered with `llm` or `yandex` without the pipeline. This integration does not return the route `home`.
 - Language is not sent separately. The pipeline uses its own language.
 - The integration does not bind the speaker to a Home Assistant device or satellite.
 - There is no `quality_scale` key in the manifest. Marketplace integrations are shown as `custom`.
+
+## Classify route
+
+If the first `system` message is the string `classify` with no spaces around it, Quasar Assist does not run the Assist pipeline. The reply is still HTTP 200 and the same completed message. `output_text` is a JSON object whose only field is `route`. The value is `llm` when the last user phrase would match an enabled `conversation` trigger of an automation that is on, and `yandex` when it would not. This integration does not return the route `home`. A match does not run the automation and does not change the dialogue timer. The route does not depend on whether the selected pipeline is available.
+
+An unknown entry answers before that logic: HTTP 200 and a short phrase, including when the phrase is empty and when the system message is `classify`. The sentence recognizer is not started.
+
+When the entry is found, an empty phrase on this route answers HTTP 500 with an empty body. Listing automations or the sentence recognizer failing answers the same HTTP 500 with an empty body. The body is empty: not JSON and not a short phrase. The pipeline is not started, and the dialogue is left as it was.
+
+The last user phrase and the pipeline reply speech are written only in one debug line for each `POST /api/quasar_assist/v1/responses`. Information, warning, error, and the downloadable diagnostics do not contain them. In Home Assistant open Settings, then System, then Logs, and search for `quasar_assist`.
 
 ## Troubleshooting
 
 - **HTTP 401.** The long-lived access token is missing, expired, or not accepted by Home Assistant. Create a new token and update `QUASAR_LLM_API_KEY`. This integration does not log the token or the `Authorization` header.
 - **The bridge says the entry was not found.** `model` is empty, unknown, or belongs to another integration. Open `GET /api/quasar_assist/v1/models` and copy `id` into `llm_model`.
-- **A short reply says the phrase is empty.** The request had no `user` message, or the last `user` text was empty. The pipeline is not started, and an open dialogue is left as it is.
+- **A short reply says the phrase is empty.** Without `classify`, the request had no `user` message, or the last `user` text was empty. The pipeline is not started, and an open dialogue is left as it is. When the entry is found and the first system message is exactly `classify`, the same empty phrase is HTTP 500 with an empty body.
 - **A short Russian reply says the request failed.** The selected pipeline is gone, the pipeline returned empty speech, or the run failed. The dialogue for that entry is closed. There is no second attempt. If the pipeline was removed, or the entry was created before a pipeline was stored, Home Assistant shows a repair; reconfigure the entry and choose a pipeline. The loss is logged once, and the recovery is logged once.
 - **The body is rejected with HTTP 400.** `input` is missing or is not a list, or the last `user` content is not a string. The pipeline is not started. An empty `user` string is not this error.
 - **The speaker stays silent.** The bridge rejects a reply that contains tool-call markup. This integration returns only plain `output_text` and does not add a `function_call`.
