@@ -251,7 +251,7 @@ class ResponsesView(HomeAssistantView):
             return self.json(completed_body(PHRASE_EMPTY))
 
         if branch:
-            return self._route(hass, text, turn)
+            return await self._route(hass, text, turn)
 
         runtime = runtime_of(entry)
         if runtime is None:
@@ -285,14 +285,16 @@ class ResponsesView(HomeAssistantView):
             hold_chat_session(hass, entry)
             return self.json(completed_body(reply.speech))
 
-    def _route(self, hass: HomeAssistant, text: str, turn: _TurnLog) -> web.Response:
-        """Вернуть JSON маршрута. Сбой перечисления или распознавателя — пустой 500.
+    async def _route(
+        self, hass: HomeAssistant, text: str, turn: _TurnLog
+    ) -> web.Response:
+        """Вернуть JSON маршрута. Нет агента или прочее исключение — пустой 500.
 
         Конвейер, замок и таймер диалога здесь не используются. Отмена
         задачи и останов интерпретатора не становятся пустым 500.
         """
         try:
-            route = match_route(hass, text)
+            route = await match_route(hass, text)
         except BaseException as err:
             if isinstance(err, _PASSTHROUGH_FAILURES):
                 raise

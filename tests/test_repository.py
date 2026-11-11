@@ -119,7 +119,7 @@ def test_manifest_and_hacs() -> None:
     ]
     assert manifest["domain"] == "quasar_assist"
     assert manifest["name"] == "Quasar Assist"
-    assert manifest["version"] == "0.3.0"
+    assert manifest["version"] == "0.4.0"
     assert manifest["config_flow"] is True
     assert manifest["dependencies"] == ["assist_pipeline"]
     assert manifest["documentation"] == (
@@ -182,7 +182,7 @@ def test_readme_translations_and_icons() -> None:
 
 
 def test_readme_describes_classify_route() -> None:
-    """AC-13: оба README описывают маршрут, пустой 500 и отладочный журнал."""
+    """AC-11: оба README описывают агента, пустой 500 и отладочный журнал."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     russian = (ROOT / "README.ru.md").read_text(encoding="utf-8")
     for text in (readme, russian):
@@ -192,21 +192,36 @@ def test_readme_describes_classify_route() -> None:
         assert "HTTP 500" in text
         assert "quasar_assist" in text
         assert "home" in text
+        assert "CancelledError" in text
+        assert "KeyboardInterrupt" in text
+        assert "SystemExit" in text
+        assert "GeneratorExit" in text
     assert "does not run the Assist pipeline" in readme
+    assert "built-in agent" in readme
+    assert "including triggers of scripts" in readme
+    assert "strict intent" in readme
+    assert "does not execute the automation, the script, or the intent" in readme
     assert "empty body" in readme
     assert "short phrase" in readme
+    assert "unknown entry" in readme.lower() or "An unknown entry" in readme
     assert "debug" in readme
     assert "Settings" in readme
     assert "System" in readme
     assert "Logs" in readme
-    assert "без конвейера" in russian or "не запускает конвейер" in russian
+    assert "automation that is on" not in readme
+    assert "не запускает конвейер" in russian
+    assert "встроенный агент" in russian
+    assert "включая сценарии" in russian
+    assert "строгое намерение" in russian
+    assert "не исполняет автоматизацию, сценарий или намерение" in russian
     assert "пустым телом" in russian
     assert "короткая фраза" in russian
-    assert "ненайденная запись" in russian.lower() or "Ненайденная запись" in russian
+    assert "Ненайденная запись" in russian
     assert "отладк" in russian
     assert "Настройки" in russian
     assert "Система" in russian
     assert "Журналы" in russian
+    assert "состоянии on" not in russian
 
 
 def test_workflows_and_release_tag() -> None:
@@ -230,7 +245,7 @@ def test_workflows_and_release_tag() -> None:
         text=True,
     ).stdout.split()
     if tags:
-        assert tags == ["0.1.0"]
+        assert "0.4.0" in tags or tags == ["0.3.0"]
 
 
 def test_production_style_and_no_outbound_model() -> None:
@@ -280,13 +295,15 @@ def test_production_style_and_no_outbound_model() -> None:
 
 
 def test_package_has_no_saved_agent_field() -> None:
-    """В дереве компонента нет выбора агента диалога и сохранённого поля."""
+    """Нет сохранённого поля агента, клиент его не выбирает, converse не зовётся.
+
+    Встроенного агента достаёт get_agent_manager().default_agent.
+    Имя этого API и поле входа agent_id в classify.py разрешены.
+    """
     forbidden = (
-        "agent_id",
         "async_converse",
         "async_get_agent",
         "async_list_agents",
-        "HOME_ASSISTANT_AGENT",
         "voice assistant",
         "голосового ассистента",
         "голосовой ассистент",
@@ -297,6 +314,32 @@ def test_package_has_no_saved_agent_field() -> None:
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             assert token not in text, f"{path.name} содержит {token}"
+        if path.name == "classify.py":
+            continue
+        assert "agent_id" not in text, path.name
+        assert "HOME_ASSISTANT_AGENT" not in text, path.name
+
+    classify = (PACKAGE / "classify.py").read_text(encoding="utf-8")
+    assert "get_agent_manager" in classify
+    assert "default_agent" in classify
+    assert "async_recognize_sentence_trigger" in classify
+    assert "async_recognize_intent" in classify
+    assert "strict_intents_only" in classify
+    assert "unmatched_entities" in classify
+    assert "async_handle_sentence_triggers" not in classify
+    assert "async_handle_intents" not in classify
+    assert "hassil" not in classify
+    tree = ast.parse((PACKAGE / "runtime.py").read_text(encoding="utf-8"))
+    runtime_fields = [
+        node.target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    ]
+    assert "conversation_id" in runtime_fields
+    assert "agent_id" not in runtime_fields
+    flow = (PACKAGE / "config_flow.py").read_text(encoding="utf-8")
+    assert "CONF_PIPELINE_ID" in flow
+    assert "agent_id" not in flow
 
 
 def _names_exception(node: ast.expr) -> bool:

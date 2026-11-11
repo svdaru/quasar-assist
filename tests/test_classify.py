@@ -7,21 +7,24 @@ from typing import Any
 
 import pytest
 from aiohttp.client_exceptions import ServerDisconnectedError
+from hassil.intents import Intent, IntentData
+from hassil.models import UnmatchedTextEntity
+from hassil.recognize import RecognizeResult
 from homeassistant.components.assist_pipeline.pipeline import async_get_pipeline
 from homeassistant.components.automation import DATA_COMPONENT, AutomationEntity
-from homeassistant.components.conversation.agent_manager import AgentManager
+from homeassistant.components.conversation.agent_manager import get_agent_manager
+from homeassistant.components.conversation.const import HOME_ASSISTANT_AGENT
 from homeassistant.components.conversation.default_agent import DefaultAgent
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import TemplateError
-from homeassistant.helpers.template import Template
+from homeassistant.components.conversation.models import ConversationInput
+from homeassistant.components.conversation.trigger import async_attach_trigger
+from homeassistant.components.homeassistant.exposed_entities import (
+    async_expose_entity,
+)
+from homeassistant.core import Context, HomeAssistant
+from homeassistant.helpers.trigger import TriggerInfo, async_initialize_triggers
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 
-from custom_components.quasar_assist.classify import (
-    commands_in_config,
-    conversation_commands,
-    phrase_matches,
-)
 from custom_components.quasar_assist.const import (
     MODELS_URL,
     PHRASE_EMPTY,
@@ -30,6 +33,11 @@ from custom_components.quasar_assist.const import (
 )
 from custom_components.quasar_assist.diagnostics import (
     async_get_config_entry_diagnostics,
+)
+from custom_components.quasar_assist.http import (
+    ResponsesView,
+    _TurnLog,
+    async_load_json_body,
 )
 from tests.common import (
     PipelineCapture,
@@ -45,167 +53,7 @@ PROBE_EVENT = "route_probe_fired"
 HISTORY = "старая реплика"
 OLD_ANSWER = "старый ответ"
 SYSTEM_SECRET = "секрет-системы"
-
-
-def test_commands_in_config_filters_triggers() -> None:
-    """В выборке оба ключа, одна обёртка triggers и только включённые команды."""
-    assert commands_in_config(
-        {"trigger": {"platform": "conversation", "command": "одна"}}
-    ) == ["одна"]
-    assert commands_in_config(
-        {
-            "trigger": [{"platform": "conversation", "command": "старый"}],
-            "triggers": [{"trigger": "conversation", "command": "новый"}],
-        }
-    ) == ["старый", "новый"]
-    assert commands_in_config(
-        {"triggers": [{"trigger": "conversation", "command": ["а", "б"]}]}
-    ) == ["а", "б"]
-    assert commands_in_config(
-        {
-            "triggers": [
-                {
-                    "platform": "conversation",
-                    "command": "скрытая",
-                    "enabled": False,
-                },
-                {"platform": "conversation", "command": "явная", "enabled": True},
-                {"platform": "state", "command": "не та"},
-                {"platform": "conversation", "command": ["да", 1, None]},
-                "не словарь",
-                {"platform": "conversation"},
-            ]
-        }
-    ) == ["явная", "да"]
-    assert commands_in_config(
-        {
-            "triggers": [
-                {
-                    "triggers": [
-                        {"platform": "conversation", "command": "внутри"},
-                    ]
-                }
-            ]
-        }
-    ) == ["внутри"]
-    assert commands_in_config(
-        {
-            "trigger": [
-                {
-                    "triggers": [
-                        {"trigger": "conversation", "command": "старая"},
-                    ]
-                }
-            ]
-        }
-    ) == ["старая"]
-    assert commands_in_config(
-        {
-            "triggers": [
-                {
-                    "triggers": {
-                        "platform": "conversation",
-                        "command": "скаляр",
-                    }
-                }
-            ]
-        }
-    ) == ["скаляр"]
-    assert (
-        commands_in_config(
-            {
-                "triggers": [
-                    {
-                        "triggers": [
-                            {"platform": "conversation", "command": "сбоку"},
-                        ],
-                        "id": "extra",
-                    }
-                ]
-            }
-        )
-        == []
-    )
-    deep = {
-        "triggers": [
-            {
-                "triggers": [
-                    {
-                        "triggers": [
-                            {
-                                "platform": "conversation",
-                                "command": "глубокая",
-                            }
-                        ]
-                    }
-                ]
-            }
-        ]
-    }
-    assert commands_in_config(deep) == []
-    assert commands_in_config(
-        {
-            "triggers": [
-                {
-                    "platform": "conversation",
-                    "command": "строка",
-                    "enabled": "не шаблон",
-                }
-            ]
-        }
-    ) == ["строка"]
-    assert (
-        commands_in_config(
-            {
-                "triggers": [
-                    {
-                        "platform": "conversation",
-                        "command": "шаблон",
-                        "enabled": "{{ false }}",
-                    }
-                ]
-            }
-        )
-        == []
-    )
-    assert commands_in_config({"other": []}) == []
-
-
-def test_commands_in_config_unwraps_dict_value() -> None:
-    """Значение-словарь trigger и triggers разворачивается один раз."""
-    inner = {"platform": "conversation", "command": "внутри"}
-    assert commands_in_config({"triggers": {"triggers": [inner]}}) == ["внутри"]
-    assert commands_in_config({"trigger": {"triggers": [inner]}}) == ["внутри"]
-    assert commands_in_config(
-        {"triggers": {"trigger": "conversation", "command": "поле"}}
-    ) == ["поле"]
-    assert commands_in_config({"triggers": {"triggers": [{"triggers": [inner]}]}}) == []
-
-
-def test_enabled_string_uses_boolean_before_template() -> None:
-    """Строка enabled сначала boolean, отказ — статический шаблон."""
-
-    def item(enabled: str) -> dict[str, Any]:
-        return {
-            "triggers": [
-                {
-                    "platform": "conversation",
-                    "command": "фраза",
-                    "enabled": enabled,
-                }
-            ]
-        }
-
-    assert commands_in_config(item("false")) == []
-    assert commands_in_config(item("off")) == []
-    assert commands_in_config(item(" OFF ")) == []
-    assert commands_in_config(item("no")) == []
-    assert commands_in_config(item("0")) == []
-    assert commands_in_config(item("disable")) == []
-    assert commands_in_config(item("true")) == ["фраза"]
-    assert commands_in_config(item("лампа")) == ["фраза"]
-    assert commands_in_config(item("")) == []
-    assert commands_in_config(item("   ")) == []
+_HIDDEN_KEYS = ("conversation_id", "pipeline_id")
 
 
 def classify_body(
@@ -241,6 +89,16 @@ def classify_body(
     return body
 
 
+def responses_without_route(model: str, text: str) -> dict[str, Any]:
+    """Обычный запрос конвейера с историей и системным текстом."""
+    return classify_body(
+        model,
+        text,
+        system="Инструкции инструментов моста",
+        later_system=SYSTEM_SECRET,
+    )
+
+
 def automation_item(
     alias: str,
     command: str | list[str],
@@ -265,18 +123,66 @@ def automation_item(
     return item
 
 
+def spoken(text: str, language: str) -> ConversationInput:
+    """Вход агента: язык задан явно, колонка не устройство и не спутник."""
+    return ConversationInput(
+        text=text,
+        context=Context(),
+        conversation_id=None,
+        device_id=None,
+        satellite_id=None,
+        language=language,
+        agent_id=HOME_ASSISTANT_AGENT,
+    )
+
+
 async def async_setup_automations(
     hass: HomeAssistant, items: list[dict[str, Any]]
 ) -> None:
-    """Поднять автоматизации. Неудачная схема роняет тест."""
+    """Поднять встроенного агента и автоматизации. Неудачная схема роняет тест."""
+    assert await async_setup_component(hass, "conversation", {})
     assert await async_setup_component(hass, "automation", {"automation": items})
     await hass.async_block_till_done()
+
+
+async def async_builtin_agent(hass: HomeAssistant) -> DefaultAgent:
+    """Поднять встроенного агента и вернуть его."""
+    assert await async_setup_component(hass, "conversation", {})
+    await hass.async_block_till_done()
+    agent = get_agent_manager(hass).default_agent
+    assert agent is not None
+    return agent
+
+
+def put_light(hass: HomeAssistant, entity_id: str, name: str, *, exposed: bool) -> None:
+    """Поставить свет и явно открыть или закрыть его голосовому помощнику."""
+    hass.states.async_set(entity_id, "off", {"friendly_name": name})
+    async_expose_entity(hass, "conversation", entity_id, exposed)
 
 
 def listen(hass: HomeAssistant) -> list[Any]:
     """События действия автоматизации после этой подписки."""
     found: list[Any] = []
     hass.bus.async_listen(PROBE_EVENT, lambda event: found.append(event))
+    return found
+
+
+def service_names(hass: HomeAssistant) -> list[tuple[str | None, str | None]]:
+    """Имена служб, которые вызвали после этой подписки."""
+    found: list[tuple[str | None, str | None]] = []
+
+    def _remember(event: Any) -> None:
+        data = event.data
+        domain = data.get("domain")
+        service = data.get("service")
+        found.append(
+            (
+                domain if isinstance(domain, str) else None,
+                service if isinstance(service, str) else None,
+            )
+        )
+
+    hass.bus.async_listen("call_service", _remember)
     return found
 
 
@@ -292,6 +198,29 @@ def forbid_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def forbid_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Исполнение триггера, намерения и автоматизации — ошибка теста."""
+
+    async def _forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("исполнение")
+
+    monkeypatch.setattr(DefaultAgent, "async_handle_sentence_triggers", _forbidden)
+    monkeypatch.setattr(DefaultAgent, "async_handle_intents", _forbidden)
+    monkeypatch.setattr(AutomationEntity, "async_trigger", _forbidden)
+
+
+def watch_route(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Запомнить вызов маршрута и вернуть llm, если его всё же вызвали."""
+    seen: list[str] = []
+
+    async def _called(*_args: object, **_kwargs: object) -> str:
+        seen.append("route")
+        return "llm"
+
+    monkeypatch.setattr("custom_components.quasar_assist.http.match_route", _called)
+    return seen
+
+
 def own_messages(
     caplog: pytest.LogCaptureFixture, *, level: int | None = None
 ) -> list[str]:
@@ -304,6 +233,13 @@ def own_messages(
             continue
         messages.append(record.getMessage())
     return messages
+
+
+def assert_no_route_literals(messages: list[str]) -> None:
+    """В строках модуля нет литералов маршрута."""
+    for message in messages:
+        assert "llm" not in message
+        assert "yandex" not in message
 
 
 async def read_route(response: Any) -> str:
@@ -328,12 +264,26 @@ async def assert_empty_500(response: Any) -> None:
     assert await response.read() == b""
 
 
-async def test_match_returns_llm_without_pipeline_or_action(
+class _Guard(dict[str, Any]):
+    """Тело, которое не отдаёт идентификатор диалога и конвейер."""
+
+    def __getitem__(self, key: str) -> Any:
+        if key in _HIDDEN_KEYS:
+            raise AssertionError(key)
+        return dict.__getitem__(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in _HIDDEN_KEYS:
+            raise AssertionError(key)
+        return dict.get(self, key, default)
+
+
+async def test_automation_trigger_is_llm(
     hass: HomeAssistant,
     hass_client: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-01 и AC-06: совпадение даёт llm, диалог и автоматизация не тронуты."""
+    """AC-01: триггер автоматизации даёт llm, действие и конвейер молчат."""
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
     capture = PipelineCapture()
     patch_execute(monkeypatch, capture)
@@ -342,10 +292,8 @@ async def test_match_returns_llm_without_pipeline_or_action(
     moment = dt_util.utcnow()
     entry.runtime_data.conversation_id = "live-dialogue"
     entry.runtime_data.last_success = moment
-    await async_setup_automations(
-        hass,
-        [automation_item("Лампа", "включи лампу")],
-    )
+    phrase = "включи лампу"
+    await async_setup_automations(hass, [automation_item("Лампа", phrase)])
     calls: list[str] = []
 
     def _refresh(*_args: object, **_kwargs: object) -> bool:
@@ -361,37 +309,52 @@ async def test_match_returns_llm_without_pipeline_or_action(
     def _hold(*_args: object, **_kwargs: object) -> None:
         calls.append("hold")
 
-    def _register(self: object, *_args: object, **_kwargs: object) -> None:
-        del self
+    def _register(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("register_trigger")
 
-    async def _recognize(self: object, *_args: object, **_kwargs: object) -> None:
-        del self
-        raise AssertionError("async_recognize_sentence_trigger")
+    original_trigger = DefaultAgent.async_recognize_sentence_trigger
+    seen: list[str] = []
 
-    async def _trigger(self: object, *_args: object, **_kwargs: object) -> None:
-        del self
-        raise AssertionError("async_trigger")
+    async def _trigger(self: DefaultAgent, user_input: ConversationInput) -> Any:
+        seen.append("trigger")
+        assert user_input.text == phrase
+        assert user_input.language == hass.config.language
+        assert user_input.device_id is None
+        assert user_input.satellite_id is None
+        return await original_trigger(self, user_input)
+
+    async def _intent(
+        self: DefaultAgent,
+        user_input: ConversationInput,
+        strict_intents_only: bool = False,
+    ) -> Any:
+        del self, user_input, strict_intents_only
+        seen.append("intent")
+        raise AssertionError("async_recognize_intent")
 
     monkeypatch.setattr(
-        "custom_components.quasar_assist.http.refresh_pipeline",
-        _refresh,
+        "custom_components.quasar_assist.http.refresh_pipeline", _refresh
     )
     monkeypatch.setattr("custom_components.quasar_assist.http.close_dialogue", _close)
     monkeypatch.setattr(
         "custom_components.quasar_assist.http.remember_success", _remember
     )
     monkeypatch.setattr("custom_components.quasar_assist.http.hold_chat_session", _hold)
-    monkeypatch.setattr(AgentManager, "register_trigger", _register)
-    monkeypatch.setattr(DefaultAgent, "async_recognize_sentence_trigger", _recognize)
-    monkeypatch.setattr(AutomationEntity, "async_trigger", _trigger)
+    monkeypatch.setattr(
+        "homeassistant.components.conversation.agent_manager.AgentManager.register_trigger",
+        _register,
+    )
+    monkeypatch.setattr(DefaultAgent, "async_recognize_sentence_trigger", _trigger)
+    monkeypatch.setattr(DefaultAgent, "async_recognize_intent", _intent)
+    forbid_execution(monkeypatch)
     fired = listen(hass)
     client = await hass_client()
     response = await client.post(
         RESPONSES_URL,
-        json=classify_body(entry.entry_id, "включи лампу"),
+        json=classify_body(entry.entry_id, phrase),
     )
     assert await read_route(response) == "llm"
+    assert seen == ["trigger"]
     assert capture.inputs == []
     assert fired == []
     assert calls == []
@@ -399,165 +362,223 @@ async def test_match_returns_llm_without_pipeline_or_action(
     assert entry.runtime_data.last_success == moment
 
 
-async def test_no_match_returns_yandex(
+async def test_script_trigger_is_llm(
     hass: HomeAssistant,
     hass_client: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-02 и AC-06: нет подходящей команды — yandex, не HTTP 500."""
+    """AC-02: триггер сценария даёт llm, сценарий не выполняется."""
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
     forbid_pipeline(monkeypatch)
+    forbid_execution(monkeypatch)
     entry = await async_add_entry(hass, pipeline_id)
     moment = dt_util.utcnow()
     entry.runtime_data.conversation_id = "live-dialogue"
     entry.runtime_data.last_success = moment
-    client = await hass_client()
-
-    seen: list[str] = []
-
-    def _spy(_hass: HomeAssistant, text: str, _sentences: list[str]) -> bool:
-        seen.append(text)
-        raise AssertionError("распознаватель")
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.classify.phrase_matches",
-        _spy,
-    )
-    missing = await client.post(
-        RESPONSES_URL,
-        json=classify_body(entry.entry_id, "нет такой команды"),
-    )
-    assert await read_route(missing) == "yandex"
-    assert seen == []
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.classify.phrase_matches",
-        phrase_matches,
-    )
-    await async_setup_automations(
-        hass,
-        [automation_item("Другая", "совсем другая фраза")],
-    )
-    other = await client.post(
-        RESPONSES_URL,
-        json=classify_body(entry.entry_id, "нет такой команды"),
-    )
-    assert await read_route(other) == "yandex"
-    assert entry.runtime_data.conversation_id == "live-dialogue"
-    assert entry.runtime_data.last_success == moment
-
-    for entity in hass.data[DATA_COMPONENT].entities:
-        entity.raw_config = None
-    cleared = await client.post(
-        RESPONSES_URL,
-        json=classify_body(entry.entry_id, "нет такой команды"),
-    )
-    assert await read_route(cleared) == "yandex"
-
-
-async def test_optional_fragment_and_slot_match(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """AC-03: необязательный фрагмент и подстановка дают llm без запуска."""
-    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
-    forbid_pipeline(monkeypatch)
-    entry = await async_add_entry(hass, pipeline_id)
-    await async_setup_automations(
-        hass,
-        [
-            automation_item("Вежливо", "включи [пожалуйста] свет"),
-            automation_item("Комната", "включи {комната} лампу"),
-        ],
-    )
-    fired = listen(hass)
-    client = await hass_client()
-    phrases = ("включи свет", "включи пожалуйста свет", "включи кухню лампу")
-    for phrase in phrases:
-        response = await client.post(
-            RESPONSES_URL,
-            json=classify_body(entry.entry_id, phrase, history=False),
-        )
-        assert await read_route(response) == "llm"
-    assert fired == []
-
-
-async def test_disabled_off_and_script_do_not_match(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """AC-04: выключенная автоматизация, выключенный триггер и сценарий — yandex."""
-    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
-    forbid_pipeline(monkeypatch)
-    entry = await async_add_entry(hass, pipeline_id)
-    command = "общая команда"
-    await async_setup_automations(
-        hass,
-        [
-            automation_item("Выключена", command, initial_state=False),
-            {
-                "alias": "Смешанная",
-                "triggers": [
-                    {"platform": "conversation", "command": "другая команда"},
-                    {
-                        "platform": "conversation",
-                        "command": command,
-                        "enabled": False,
-                    },
-                ],
-                "actions": [{"event": PROBE_EVENT}],
-            },
-        ],
-    )
+    phrase = "фраза сценария"
+    await async_builtin_agent(hass)
     assert await async_setup_component(
         hass,
         "script",
         {
             "script": {
                 "probe_script": {
-                    "alias": command,
+                    "alias": "Проба",
                     "sequence": [{"event": PROBE_EVENT}],
                 }
             }
         },
     )
     await hass.async_block_till_done()
+    ran: list[str] = []
+
+    async def _action(
+        run_variables: dict[str, Any], context: Context | None = None
+    ) -> None:
+        del run_variables, context
+        ran.append("script")
+        await hass.services.async_call("script", "probe_script", blocking=True)
+
+    def _silent(*_args: object, **_kwargs: object) -> None:
+        return
+
+    remove = await async_initialize_triggers(
+        hass,
+        [{"platform": "conversation", "command": [phrase]}],
+        _action,
+        "script",
+        "probe_script",
+        _silent,
+    )
+    assert remove is not None
+    assert phrase in get_agent_manager(hass).trigger_sentences
+    assert hass.data.get(DATA_COMPONENT) is None
     fired = listen(hass)
     client = await hass_client()
     response = await client.post(
         RESPONSES_URL,
-        json=classify_body(entry.entry_id, command, history=False),
+        json=classify_body(entry.entry_id, phrase, history=False),
     )
-    assert await read_route(response) == "yandex"
+    assert await read_route(response) == "llm"
+    assert ran == []
     assert fired == []
+    state = hass.states.get("script.probe_script")
+    assert state is not None
+    assert state.attributes.get("last_triggered") is None
+    assert entry.runtime_data.conversation_id == "live-dialogue"
+    assert entry.runtime_data.last_success == moment
 
 
-async def test_second_command_in_the_list_matches(
+async def test_strict_intent_is_llm(
     hass: HomeAssistant,
     hass_client: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-05: любая команда одного триггера даёт llm."""
+    """AC-03: строгое намерение открытой сущности даёт llm без исполнения."""
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
     forbid_pipeline(monkeypatch)
+    forbid_execution(monkeypatch)
     entry = await async_add_entry(hass, pipeline_id)
-    await async_setup_automations(
-        hass,
-        [
-            automation_item(
-                "Список",
-                ["первая команда", "вторая команда"],
-            )
-        ],
-    )
+    await async_builtin_agent(hass)
+    put_light(hass, "light.kitchen", "kitchen", exposed=True)
+    phrase = "turn on kitchen"
+    services = service_names(hass)
     client = await hass_client()
     response = await client.post(
         RESPONSES_URL,
-        json=classify_body(entry.entry_id, "вторая команда", history=False),
+        json=classify_body(entry.entry_id, phrase, history=False),
     )
     assert await read_route(response) == "llm"
+    kitchen = hass.states.get("light.kitchen")
+    assert kitchen is not None
+    assert kitchen.state == "off"
+    assert ("light", "turn_on") not in services
+
+
+async def test_unexposed_name_is_yandex(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-04: имя не среди открытых сущностей — yandex, намерение не исполняется."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    forbid_execution(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    moment = dt_util.utcnow()
+    entry.runtime_data.conversation_id = "live-dialogue"
+    entry.runtime_data.last_success = moment
+    await async_builtin_agent(hass)
+    put_light(hass, "light.bedlamp", "bedlamp", exposed=False)
+    services = service_names(hass)
+    client = await hass_client()
+    response = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, "turn on bedlamp", history=False),
+    )
+    assert await read_route(response) == "yandex"
+    bedlamp = hass.states.get("light.bedlamp")
+    assert bedlamp is not None
+    assert bedlamp.state == "off"
+    assert ("light", "turn_on") not in services
+    assert entry.runtime_data.conversation_id == "live-dialogue"
+    assert entry.runtime_data.last_success == moment
+
+
+async def test_unmatched_entities_are_yandex(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Поле unmatched_entities: пустое даёт llm, непустое — yandex."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    forbid_execution(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    await async_builtin_agent(hass)
+    unmatched = RecognizeResult(
+        intent=Intent("HassTurnOn"),
+        intent_data=IntentData([]),
+        unmatched_entities={"name": UnmatchedTextEntity("name", "спальня")},
+    )
+    matched = RecognizeResult(
+        intent=Intent("HassTurnOn"),
+        intent_data=IntentData([]),
+    )
+    assert not matched.unmatched_entities
+    queued = [unmatched, matched]
+    flags: list[bool] = []
+
+    async def _intent(
+        self: DefaultAgent,
+        user_input: ConversationInput,
+        strict_intents_only: bool = False,
+    ) -> RecognizeResult:
+        del self
+        assert user_input.device_id is None
+        assert user_input.satellite_id is None
+        flags.append(strict_intents_only)
+        return queued.pop(0)
+
+    monkeypatch.setattr(DefaultAgent, "async_recognize_intent", _intent)
+    client = await hass_client()
+    hidden = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, "turn on спальня", history=False),
+    )
+    clean = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, "turn on kitchen", history=False),
+    )
+    assert await read_route(hidden) == "yandex"
+    assert await read_route(clean) == "llm"
+    assert flags == [True, True]
+
+
+async def test_no_trigger_and_no_intent_is_yandex(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-05: ни триггер, ни строгое намерение — yandex."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    moment = dt_util.utcnow()
+    entry.runtime_data.conversation_id = "live-dialogue"
+    entry.runtime_data.last_success = moment
+    await async_builtin_agent(hass)
+    client = await hass_client()
+    response = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, "фразу никто не знает", history=False),
+    )
+    assert await read_route(response) == "yandex"
+    assert entry.runtime_data.conversation_id == "live-dialogue"
+    assert entry.runtime_data.last_success == moment
+
+
+async def test_disabled_automation_is_yandex(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-06: выключенная автоматизация без сценария и намерения — yandex."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    phrase = "команда выключенной автоматизации"
+    await async_setup_automations(
+        hass,
+        [automation_item("Выключена", phrase, initial_state=False)],
+    )
+    assert phrase not in get_agent_manager(hass).trigger_sentences
+    client = await hass_client()
+    response = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, phrase, history=False),
+    )
+    assert await read_route(response) == "yandex"
 
 
 async def test_without_classify_runs_pipeline(
@@ -565,33 +586,39 @@ async def test_without_classify_runs_pipeline(
     hass_client: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-07: без ветки непустая фраза идёт в конвейер, ответ — речь."""
+    """AC-07: без ветки фраза идёт в конвейер, наш маршрут не вызывается."""
     pipeline_id, engine = await async_create_pipeline(hass, "Спальня")
     engine.speech = "Включила свет"
     capture = PipelineCapture()
     patch_execute(monkeypatch, capture)
     entry = await async_add_entry(hass, pipeline_id)
+    seen = watch_route(monkeypatch)
     client = await hass_client()
-    response = await client.post(
-        RESPONSES_URL,
-        json=classify_body(
-            entry.entry_id,
-            "включи свет",
-            system="Инструкции инструментов моста",
-            history=False,
-        ),
+    body = classify_body(
+        entry.entry_id,
+        "включи свет",
+        system="Инструкции инструментов моста",
+        history=False,
     )
-    assert response.status == 200
-    payload = await response.json()
+    first = await client.post(RESPONSES_URL, json=body)
+    assert first.status == 200
+    payload = await first.json()
     speech = intent_speech(capture.events[0])
     assert_completed(payload, speech)
     assert speech == "Включила свет"
     assert json.dumps(payload).find('{"route"') == -1
-    assert len(capture.inputs) == 1
+    # Нет встроенного агента: запрос без ветки не становится пустым 500.
+    get_agent_manager(hass).default_agent = None
+    second = await client.post(RESPONSES_URL, json=body)
+    assert second.status == 200
+    second_payload = await second.json()
+    second_text = second_payload["output"][0]["content"][0]["text"]
+    assert isinstance(second_text, str)
+    assert "route" not in second_text
+    assert len(capture.inputs) == 2
+    assert seen == []
     assert capture.inputs[0].run.start_stage.name == "INTENT"
     assert capture.inputs[0].run.end_stage.name == "INTENT"
-    assert entry.runtime_data.conversation_id is not None
-    assert entry.runtime_data.last_success is not None
 
 
 async def test_missing_pipeline_still_classifies(
@@ -599,7 +626,7 @@ async def test_missing_pipeline_still_classifies(
     hass_client: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-08: пропавший конвейер и пустой runtime_data не мешают маршруту."""
+    """AC-08: пропавший конвейер не мешает классификации и не закрывает диалог."""
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
     forbid_pipeline(monkeypatch)
     entry = await async_add_entry(hass, pipeline_id)
@@ -607,10 +634,7 @@ async def test_missing_pipeline_still_classifies(
     entry.runtime_data.conversation_id = "live-dialogue"
     entry.runtime_data.last_success = moment
     entry.runtime_data.pipeline_unavailable = False
-    await async_setup_automations(
-        hass,
-        [automation_item("Лампа", "включи лампу")],
-    )
+    await async_setup_automations(hass, [automation_item("Лампа", "включи лампу")])
     await async_delete_pipeline(hass, pipeline_id)
     client = await hass_client()
     response = await client.post(
@@ -632,6 +656,127 @@ async def test_missing_pipeline_still_classifies(
     assert getattr(bare, "runtime_data", None) is None
 
 
+async def test_home_assistant_language(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-09: совпадение только при языке Home Assistant, без устройства."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня", language="en")
+    stored = async_get_pipeline(hass, pipeline_id)
+    assert stored.conversation_language == "en"
+    forbid_pipeline(monkeypatch)
+    forbid_execution(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    hass.config.language = "en"
+    agent = await async_builtin_agent(hass)
+    trigger_phrase = "pegel zwanzig"
+    intent_phrase = "schalte kuche an"
+    await async_setup_automations(
+        hass,
+        [automation_item("Уровень", "pegel {1..30:n}")],
+    )
+    put_light(hass, "light.kuche", "kuche", exposed=True)
+    hass.config.language = "en"
+    agent._trigger_intents = None
+    assert (
+        await agent.async_recognize_sentence_trigger(spoken(trigger_phrase, "en"))
+        is None
+    )
+    hass.config.language = "ru"
+    agent._trigger_intents = None
+    assert (
+        await agent.async_recognize_sentence_trigger(spoken(trigger_phrase, "ru"))
+        is None
+    )
+    hass.config.language = "de"
+    agent._trigger_intents = None
+    assert (
+        await agent.async_recognize_sentence_trigger(spoken(trigger_phrase, "ru"))
+        is not None
+    )
+    assert (
+        await agent.async_recognize_intent(
+            spoken(intent_phrase, "en"), strict_intents_only=True
+        )
+        is None
+    )
+    assert (
+        await agent.async_recognize_intent(
+            spoken(intent_phrase, "ru"), strict_intents_only=True
+        )
+        is None
+    )
+    german = await agent.async_recognize_intent(
+        spoken(intent_phrase, "de"), strict_intents_only=True
+    )
+    assert german is not None
+    assert not german.unmatched_entities
+    assert stored.conversation_language == "en"
+    assert hass.config.language == "de"
+    calls: list[tuple[str, dict[str, Any], ConversationInput]] = []
+    original_trigger = DefaultAgent.async_recognize_sentence_trigger
+    original_intent = DefaultAgent.async_recognize_intent
+
+    async def _trigger(
+        self: DefaultAgent, user_input: ConversationInput, **kwargs: Any
+    ) -> Any:
+        calls.append(("trigger", kwargs, user_input))
+        return await original_trigger(self, user_input, **kwargs)
+
+    async def _intent(
+        self: DefaultAgent,
+        user_input: ConversationInput,
+        strict_intents_only: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        calls.append(
+            (
+                "intent",
+                {"strict_intents_only": strict_intents_only, **kwargs},
+                user_input,
+            )
+        )
+        return await original_intent(
+            self,
+            user_input,
+            strict_intents_only=strict_intents_only,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(DefaultAgent, "async_recognize_sentence_trigger", _trigger)
+    monkeypatch.setattr(DefaultAgent, "async_recognize_intent", _intent)
+    client = await hass_client()
+    trigger_body = classify_body(
+        entry.entry_id,
+        trigger_phrase,
+        history=False,
+        language="ru",
+    )
+    intent_body = classify_body(
+        entry.entry_id,
+        intent_phrase,
+        history=False,
+        language="ru",
+    )
+    assert trigger_body["language"] == "ru"
+    triggered = await client.post(RESPONSES_URL, json=trigger_body)
+    intended = await client.post(RESPONSES_URL, json=intent_body)
+    assert await read_route(triggered) == "llm"
+    assert await read_route(intended) == "llm"
+    assert [item[0] for item in calls] == ["trigger", "trigger", "intent"]
+    for _kind, kwargs, user_input in calls:
+        assert "device_id" not in kwargs
+        assert "satellite_id" not in kwargs
+        assert user_input.device_id is None
+        assert user_input.satellite_id is None
+        assert user_input.language == "de"
+    assert calls[2][1]["strict_intents_only"] is True
+    kuche = hass.states.get("light.kuche")
+    assert kuche is not None
+    assert kuche.state == "off"
+
+
 async def test_classify_debug_line(
     hass: HomeAssistant,
     hass_client: Any,
@@ -639,15 +784,12 @@ async def test_classify_debug_line(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """AC-09: одна отладочная строка с репликой и маршрутом, без истории."""
+    """AC-10: одна отладочная строка с репликой и маршрутом, без истории."""
     pipeline_id, engine = await async_create_pipeline(hass, "Спальня")
     engine.speech = "речь-конвейера-которой-нет"
     forbid_pipeline(monkeypatch)
     entry = await async_add_entry(hass, pipeline_id)
-    await async_setup_automations(
-        hass,
-        [automation_item("Лампа", "включи лампу")],
-    )
+    await async_setup_automations(hass, [automation_item("Лампа", "включи лампу")])
     client = await hass_client()
     phrase = "включи лампу"
     caplog.set_level("DEBUG", logger="custom_components.quasar_assist")
@@ -684,7 +826,7 @@ async def test_pipeline_debug_line(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """AC-10: одна отладочная строка содержит реплику и речь, токена нет."""
+    """Одна отладочная строка конвейера содержит реплику и речь, токена нет."""
     pipeline_id, engine = await async_create_pipeline(hass, "Спальня")
     phrase = "реплика-хода"
     speech = "речь-ответа-конвейера"
@@ -710,14 +852,190 @@ async def test_pipeline_debug_line(
     assert "authorization" not in own.lower()
 
 
-def responses_without_route(model: str, text: str) -> dict[str, Any]:
-    """Обычный запрос конвейера с историей и системным текстом."""
-    return classify_body(
-        model,
-        text,
-        system="Инструкции инструментов моста",
-        later_system=SYSTEM_SECRET,
+async def test_registered_trigger_copy_is_llm(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-12: уже зарегистрированный триггер даёт llm и ничего не исполняет."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    forbid_execution(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    await async_builtin_agent(hass)
+    phrase = "фраза копии"
+    ran: list[object] = []
+
+    async def _action(
+        run_variables: dict[str, Any], context: Context | None = None
+    ) -> None:
+        del context
+        ran.append(run_variables)
+
+    info: TriggerInfo = {
+        "domain": "conversation",
+        "name": "copy",
+        "variables": None,
+        "trigger_data": {"id": "copy", "idx": "0", "alias": None},
+    }
+    remove = await async_attach_trigger(
+        hass,
+        {"platform": "conversation", "command": [phrase]},
+        _action,
+        info,
     )
+    assert remove is not None
+    assert phrase in get_agent_manager(hass).trigger_sentences
+    saved = [
+        state.entity_id
+        for state in hass.states.async_all()
+        if state.entity_id.startswith(("automation.", "script."))
+    ]
+    assert saved == []
+    client = await hass_client()
+    response = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, phrase, history=False),
+    )
+    assert await read_route(response) == "llm"
+    assert ran == []
+
+
+async def test_optional_fragment_and_slot_match(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-13: необязательный фрагмент и подстановка дают llm без запуска."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    forbid_execution(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    await async_setup_automations(
+        hass,
+        [
+            automation_item("Вежливо", "включи [пожалуйста] свет"),
+            automation_item("Комната", "включи {комната} лампу"),
+        ],
+    )
+    fired = listen(hass)
+    client = await hass_client()
+    phrases = ("включи свет", "включи пожалуйста свет", "включи кухню лампу")
+    for phrase in phrases:
+        response = await client.post(
+            RESPONSES_URL,
+            json=classify_body(entry.entry_id, phrase, history=False),
+        )
+        assert await read_route(response) == "llm"
+    assert fired == []
+
+
+async def test_second_command_and_triggers_key(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-14: вторая команда и ключ triggers дают llm через регистрацию."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    await async_setup_automations(
+        hass,
+        [
+            automation_item("Список", ["первая команда", "вторая команда"]),
+            automation_item(
+                "Новый",
+                "команда нового ключа",
+                list_key="triggers",
+                type_key="trigger",
+            ),
+        ],
+    )
+    sentences = get_agent_manager(hass).trigger_sentences
+    assert "вторая команда" in sentences
+    assert "команда нового ключа" in sentences
+    client = await hass_client()
+    for phrase in ("вторая команда", "команда нового ключа"):
+        response = await client.post(
+            RESPONSES_URL,
+            json=classify_body(entry.entry_id, phrase, history=False),
+        )
+        assert await read_route(response) == "llm"
+
+
+async def test_disabled_trigger_is_yandex(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-15: автоматизация включена, её триггер выключен — yandex."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    phrase = "команда выключенного триггера"
+    await async_setup_automations(
+        hass,
+        [automation_item("Включена", phrase, enabled=False)],
+    )
+    assert phrase not in get_agent_manager(hass).trigger_sentences
+    client = await hass_client()
+    response = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, phrase, history=False),
+    )
+    assert await read_route(response) == "yandex"
+
+
+async def test_pipeline_agent_is_not_called(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-16: решает встроенный агент, агент конвейера не вызывается."""
+    pipeline_id, engine = await async_create_pipeline(hass, "Спальня")
+    stored = async_get_pipeline(hass, pipeline_id)
+    assert stored.conversation_engine != HOME_ASSISTANT_AGENT
+    forbid_pipeline(monkeypatch)
+    forbid_execution(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+
+    async def _refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("агент конвейера")
+
+    engine.async_recognize_sentence_trigger = _refuse  # type: ignore[attr-defined]
+    engine.async_recognize_intent = _refuse  # type: ignore[attr-defined]
+    await async_setup_automations(hass, [automation_item("Лампа", "включи лампу")])
+    client = await hass_client()
+    response = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, "включи лампу", history=False),
+    )
+    assert await read_route(response) == "llm"
+    assert engine.calls == []
+
+
+async def test_route_text_has_no_home(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-17: ни триггер, ни намерение, ни промах не пишут home."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    forbid_execution(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    await async_setup_automations(hass, [automation_item("Лампа", "включи лампу")])
+    put_light(hass, "light.kitchen", "kitchen", exposed=True)
+    client = await hass_client()
+    phrases = ("включи лампу", "turn on kitchen", "фразу никто не знает")
+    routes: list[str] = []
+    for phrase in phrases:
+        response = await client.post(
+            RESPONSES_URL,
+            json=classify_body(entry.entry_id, phrase, history=False),
+        )
+        routes.append(await read_route(response))
+    assert routes == ["llm", "llm", "yandex"]
 
 
 async def test_higher_levels_and_diagnostics_hide_phrase(
@@ -726,7 +1044,7 @@ async def test_higher_levels_and_diagnostics_hide_phrase(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """AC-11: информация, предупреждение, ошибка и диагностика без реплики и речи."""
+    """AC-18: информация, предупреждение, ошибка и диагностика без реплики."""
     pipeline_id, engine = await async_create_pipeline(hass, "Спальня")
     phrase = "реплика-диагностики"
     pipeline_phrase = "фраза-конвейера"
@@ -734,10 +1052,7 @@ async def test_higher_levels_and_diagnostics_hide_phrase(
     engine.speech = speech
     patch_execute(monkeypatch, PipelineCapture())
     entry = await async_add_entry(hass, pipeline_id)
-    await async_setup_automations(
-        hass,
-        [automation_item("Лампа", phrase)],
-    )
+    await async_setup_automations(hass, [automation_item("Лампа", phrase)])
     client = await hass_client()
     caplog.set_level("DEBUG", logger="custom_components.quasar_assist")
     caplog.clear()
@@ -770,260 +1085,16 @@ async def test_higher_levels_and_diagnostics_hide_phrase(
     assert speech not in dumped
 
 
-async def test_enumeration_and_recognizer_failures(
+async def test_foreign_form_skips_agent_and_pipeline(
     hass: HomeAssistant,
     hass_client: Any,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """AC-14 и AC-N06: сбой списка или распознавателя — пустой 500, диалог тот же."""
+    """AC-N01: чужая форма — 400, без конвейера, методов и тела в журнале."""
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
     forbid_pipeline(monkeypatch)
-    entry = await async_add_entry(hass, pipeline_id)
-    moment = dt_util.utcnow()
-    entry.runtime_data.conversation_id = "live-dialogue"
-    entry.runtime_data.last_success = moment
-    await async_setup_automations(
-        hass,
-        [automation_item("Лампа", "включи лампу")],
-    )
-    client = await hass_client()
-    caplog.set_level("DEBUG", logger="custom_components.quasar_assist")
-
-    def _list_failed(_hass: HomeAssistant) -> list[str]:
-        raise RuntimeError("секрет-перечисления")
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.classify.conversation_commands",
-        _list_failed,
-    )
-    caplog.clear()
-    listed = await client.post(
-        RESPONSES_URL,
-        json=classify_body(entry.entry_id, "включи лампу", history=False),
-    )
-    await assert_empty_500(listed)
-    assert "секрет-перечисления" not in "\n".join(own_messages(caplog))
-    assert "RuntimeError" in "\n".join(own_messages(caplog, level=logging.DEBUG))
-    assert entry.runtime_data.conversation_id == "live-dialogue"
-    assert entry.runtime_data.last_success == moment
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.classify.conversation_commands",
-        conversation_commands,
-    )
-
-    def _match_failed(_hass: HomeAssistant, _text: str, _sentences: list[str]) -> bool:
-        raise RuntimeError("секрет-распознавателя")
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.classify.phrase_matches",
-        _match_failed,
-    )
-    caplog.clear()
-    matched = await client.post(
-        RESPONSES_URL,
-        json=classify_body(entry.entry_id, "включи лампу", history=False),
-    )
-    await assert_empty_500(matched)
-    assert "секрет-распознавателя" not in "\n".join(own_messages(caplog))
-    assert entry.runtime_data.conversation_id == "live-dialogue"
-    assert entry.runtime_data.last_success == moment
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.classify.phrase_matches",
-        phrase_matches,
-    )
-    for entity in hass.data[DATA_COMPONENT].entities:
-        entity.raw_config = {
-            "triggers": [{"platform": "conversation", "command": "turn ["}],
-        }
-    caplog.clear()
-    broken = await client.post(
-        RESPONSES_URL,
-        json=classify_body(entry.entry_id, "включи лампу", history=False),
-    )
-    await assert_empty_500(broken)
-    own = "\n".join(own_messages(caplog))
-    assert "turn [" not in own
-    assert "Unable to find end" not in own
-    assert "ParseError" in "\n".join(own_messages(caplog, level=logging.DEBUG))
-    assert "включи лампу" in "\n".join(own_messages(caplog, level=logging.DEBUG))
-    assert entry.runtime_data.conversation_id == "live-dialogue"
-    assert entry.runtime_data.last_success == moment
-
-
-async def test_unknown_entry_answers_before_empty_or_classify(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """AC-15 и AC-N02: неизвестная запись — короткая фраза, не маршрут и не 500."""
-    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
-    forbid_pipeline(monkeypatch)
-
-    def _forbidden(*_args: object, **_kwargs: object) -> bool:
-        raise AssertionError("распознаватель")
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.classify.phrase_matches",
-        _forbidden,
-    )
-    await async_add_entry(hass, pipeline_id)
-    client = await hass_client()
-    bodies = [
-        classify_body("нет-такой-записи", "включи лампу"),
-        classify_body("нет-такой-записи", ""),
-        classify_body("нет-такой-записи", None),
-        classify_body(
-            "нет-такой-записи",
-            "включи лампу",
-            system="Инструкции инструментов моста",
-        ),
-        classify_body(
-            "нет-такой-записи",
-            "",
-            system="Инструкции инструментов моста",
-        ),
-    ]
-    for body in bodies:
-        response = await client.post(RESPONSES_URL, json=body)
-        assert response.status == 200
-        payload = await response.json()
-        text = payload["output"][0]["content"][0]["text"]
-        assert_completed(payload, text)
-        assert text == PHRASE_NOT_FOUND
-        assert "route" not in text
-
-
-async def test_trigger_and_triggers_keys(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """AC-16: команда в ключе trigger и в ключе triggers даёт llm."""
-    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
-    forbid_pipeline(monkeypatch)
-    entry = await async_add_entry(hass, pipeline_id)
-    await async_setup_automations(
-        hass,
-        [
-            automation_item(
-                "Старый",
-                "команда старого ключа",
-                list_key="trigger",
-                type_key="platform",
-                action_key="action",
-            ),
-            automation_item(
-                "Новый",
-                "команда нового ключа",
-                list_key="triggers",
-                type_key="trigger",
-                action_key="actions",
-            ),
-        ],
-    )
-    raws = [entity.raw_config for entity in hass.data[DATA_COMPONENT].entities]
-    assert any(isinstance(raw, dict) and "trigger" in raw for raw in raws), raws
-    assert any(isinstance(raw, dict) and "triggers" in raw for raw in raws), raws
-    fired = listen(hass)
-    client = await hass_client()
-    for phrase in ("команда старого ключа", "команда нового ключа"):
-        response = await client.post(
-            RESPONSES_URL,
-            json=classify_body(entry.entry_id, phrase, history=False),
-        )
-        assert await read_route(response) == "llm"
-    assert fired == []
-
-
-async def test_home_assistant_language_not_pipeline_language(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """AC-17: числовое слово совпадает при языке Home Assistant, не конвейера."""
-    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня", language="en")
-    stored = async_get_pipeline(hass, pipeline_id)
-    assert stored.conversation_language == "en"
-    hass.config.language = "en"
-    sentence = "pegel {1..30:n}"
-    assert phrase_matches(hass, "pegel zwanzig", [sentence]) is False
-    hass.config.language = "de"
-    assert hass.config.language != stored.conversation_language
-    assert phrase_matches(hass, "pegel zwanzig", [sentence]) is True
-    forbid_pipeline(monkeypatch)
-    entry = await async_add_entry(hass, pipeline_id)
-    await async_setup_automations(
-        hass,
-        [automation_item("Уровень", sentence)],
-    )
-    client = await hass_client()
-    response = await client.post(
-        RESPONSES_URL,
-        json=classify_body(
-            entry.entry_id,
-            "pegel zwanzig",
-            history=False,
-            language="ru",
-        ),
-    )
-    assert await read_route(response) == "llm"
-
-
-async def test_classify_branch_not_enabled(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """AC-18: пробел, нестроковый system и позднее classify не включают ветку."""
-    pipeline_id, engine = await async_create_pipeline(hass, "Спальня")
-    engine.speech = "Включила свет"
-    capture = PipelineCapture()
-    patch_execute(monkeypatch, capture)
-    entry = await async_add_entry(hass, pipeline_id)
-    client = await hass_client()
-    bodies = [
-        classify_body(entry.entry_id, "включи свет", system=" classify"),
-        classify_body(
-            entry.entry_id,
-            "включи свет",
-            system={"text": "classify"},
-        ),
-        classify_body(
-            entry.entry_id,
-            "включи свет",
-            system="другие инструкции",
-            later_system="classify",
-        ),
-    ]
-    for body in bodies:
-        response = await client.post(RESPONSES_URL, json=body)
-        assert response.status == 200
-        payload = await response.json()
-        assert_completed(payload, "Включила свет")
-        assert "route" not in payload["output"][0]["content"][0]["text"]
-    assert len(capture.inputs) == len(bodies)
-
-
-async def test_foreign_form_skips_recognizer_and_log(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """AC-N01: чужая форма — 400, без конвейера, распознавателя и тела в журнале."""
-    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
-    forbid_pipeline(monkeypatch)
-
-    def _forbidden(*_args: object, **_kwargs: object) -> bool:
-        raise AssertionError("распознаватель")
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.classify.phrase_matches",
-        _forbidden,
-    )
+    seen = watch_route(monkeypatch)
     entry = await async_add_entry(hass, pipeline_id)
     client = await hass_client()
     marker = "секрет-чужого-тела"
@@ -1049,9 +1120,84 @@ async def test_foreign_form_skips_recognizer_and_log(
     ]
     for response in rejected:
         assert response.status == 400
+    assert seen == []
     own = "\n".join(own_messages(caplog))
     assert marker not in own
     assert len(own_messages(caplog, level=logging.DEBUG)) == len(rejected)
+
+
+async def test_unknown_entry_answers_before_empty_or_classify(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-N02: неизвестная запись — короткая фраза, не маршрут и не 500."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    seen = watch_route(monkeypatch)
+    await async_add_entry(hass, pipeline_id)
+    client = await hass_client()
+    bodies = [
+        classify_body("нет-такой-записи", "включи лампу"),
+        classify_body("нет-такой-записи", ""),
+        classify_body("нет-такой-записи", None),
+        classify_body(
+            "нет-такой-записи",
+            "включи лампу",
+            system="Инструкции инструментов моста",
+        ),
+        classify_body(
+            "нет-такой-записи",
+            "",
+            system="Инструкции инструментов моста",
+        ),
+    ]
+    for body in bodies:
+        response = await client.post(RESPONSES_URL, json=body)
+        assert response.status == 200
+        payload = await response.json()
+        text = payload["output"][0]["content"][0]["text"]
+        assert_completed(payload, text)
+        assert text == PHRASE_NOT_FOUND
+        assert "route" not in text
+    assert seen == []
+
+
+async def test_classify_branch_not_enabled(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-N06: пробел, нестроковый system и позднее classify не включают ветку."""
+    pipeline_id, engine = await async_create_pipeline(hass, "Спальня")
+    engine.speech = "Включила свет"
+    capture = PipelineCapture()
+    patch_execute(monkeypatch, capture)
+    seen = watch_route(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    client = await hass_client()
+    bodies = [
+        classify_body(entry.entry_id, "включи свет", system=" classify"),
+        classify_body(
+            entry.entry_id,
+            "включи свет",
+            system={"text": "classify"},
+        ),
+        classify_body(
+            entry.entry_id,
+            "включи свет",
+            system="другие инструкции",
+            later_system="classify",
+        ),
+    ]
+    for body in bodies:
+        response = await client.post(RESPONSES_URL, json=body)
+        assert response.status == 200
+        payload = await response.json()
+        assert_completed(payload, "Включила свет")
+        assert "route" not in payload["output"][0]["content"][0]["text"]
+    assert len(capture.inputs) == len(bodies)
+    assert seen == []
 
 
 async def test_empty_phrase_without_classify_keeps_dialogue(
@@ -1059,17 +1205,10 @@ async def test_empty_phrase_without_classify_keeps_dialogue(
     hass_client: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-N03: пустая фраза без ветки — короткая фраза, диалог и конвейер на месте."""
+    """AC-N03: пустая фраза без ветки — короткая фраза, диалог на месте."""
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
     forbid_pipeline(monkeypatch)
-
-    def _forbidden(*_args: object, **_kwargs: object) -> bool:
-        raise AssertionError("распознаватель")
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.classify.phrase_matches",
-        _forbidden,
-    )
+    seen = watch_route(monkeypatch)
     entry = await async_add_entry(hass, pipeline_id)
     moment = dt_util.utcnow()
     entry.runtime_data.conversation_id = "live-dialogue"
@@ -1086,6 +1225,7 @@ async def test_empty_phrase_without_classify_keeps_dialogue(
     )
     assert response.status == 200
     assert_completed(await response.json(), PHRASE_EMPTY)
+    assert seen == []
     assert entry.runtime_data.conversation_id == "live-dialogue"
     assert entry.runtime_data.last_success == moment
 
@@ -1094,23 +1234,19 @@ async def test_empty_phrase_with_classify_is_empty_500(
     hass: HomeAssistant,
     hass_client: Any,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """AC-N05: пустая фраза найденной записи на ветке — пустой 500."""
+    """AC-N04: пустая фраза найденной записи на ветке — пустой 500."""
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
     forbid_pipeline(monkeypatch)
-
-    def _forbidden(*_args: object, **_kwargs: object) -> bool:
-        raise AssertionError("распознаватель")
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.classify.phrase_matches",
-        _forbidden,
-    )
+    seen = watch_route(monkeypatch)
     entry = await async_add_entry(hass, pipeline_id)
     moment = dt_util.utcnow()
     entry.runtime_data.conversation_id = "live-dialogue"
     entry.runtime_data.last_success = moment
     client = await hass_client()
+    caplog.set_level("DEBUG", logger="custom_components.quasar_assist")
+    caplog.clear()
     for text in ("", None):
         response = await client.post(
             RESPONSES_URL,
@@ -1119,6 +1255,200 @@ async def test_empty_phrase_with_classify_is_empty_500(
         await assert_empty_500(response)
         assert entry.runtime_data.conversation_id == "live-dialogue"
         assert entry.runtime_data.last_success == moment
+    assert seen == []
+    assert_no_route_literals(own_messages(caplog))
+
+
+async def test_missing_builtin_agent_is_empty_500(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC-N05: нет встроенного агента — пустой 500, методы не вызываются."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    moment = dt_util.utcnow()
+    entry.runtime_data.conversation_id = "live-dialogue"
+    entry.runtime_data.last_success = moment
+    calls: list[str] = []
+
+    async def _called(*_args: object, **_kwargs: object) -> None:
+        calls.append("method")
+
+    monkeypatch.setattr(DefaultAgent, "async_recognize_sentence_trigger", _called)
+    monkeypatch.setattr(DefaultAgent, "async_recognize_intent", _called)
+    # Конвейер уже поднял разговор. Убираем указатель встроенного агента.
+    manager = get_agent_manager(hass)
+    assert manager.default_agent is not None
+    manager.default_agent = None
+    client = await hass_client()
+    phrase = "включи лампу"
+    caplog.set_level("DEBUG", logger="custom_components.quasar_assist")
+    caplog.clear()
+    response = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, phrase, history=False),
+    )
+    await assert_empty_500(response)
+    assert calls == []
+    own = own_messages(caplog)
+    assert_no_route_literals(own)
+    assert "_MissingBuiltinAgentError" in "\n".join(own)
+    assert phrase in "\n".join(own_messages(caplog, level=logging.DEBUG))
+    assert entry.runtime_data.conversation_id == "live-dialogue"
+    assert entry.runtime_data.last_success == moment
+
+
+async def test_method_exceptions_are_empty_500(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC-N05: исключение каждого метода — пустой 500 без текста исключения."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    moment = dt_util.utcnow()
+    entry.runtime_data.conversation_id = "live-dialogue"
+    entry.runtime_data.last_success = moment
+    await async_builtin_agent(hass)
+    client = await hass_client()
+    caplog.set_level("DEBUG", logger="custom_components.quasar_assist")
+    intent_calls: list[str] = []
+
+    async def _trigger_failed(
+        self: DefaultAgent, user_input: ConversationInput
+    ) -> None:
+        del self, user_input
+        raise RuntimeError("секрет-триггера")
+
+    async def _intent_count(
+        self: DefaultAgent,
+        user_input: ConversationInput,
+        strict_intents_only: bool = False,
+    ) -> Any:
+        del self, user_input, strict_intents_only
+        intent_calls.append("intent")
+        return None
+
+    monkeypatch.setattr(
+        DefaultAgent, "async_recognize_sentence_trigger", _trigger_failed
+    )
+    monkeypatch.setattr(DefaultAgent, "async_recognize_intent", _intent_count)
+    caplog.clear()
+    triggered = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, "включи лампу", history=False),
+    )
+    await assert_empty_500(triggered)
+    own = "\n".join(own_messages(caplog))
+    assert "секрет-триггера" not in own
+    assert_no_route_literals(own_messages(caplog))
+    assert "RuntimeError" in own
+    assert intent_calls == []
+    assert entry.runtime_data.conversation_id == "live-dialogue"
+    assert entry.runtime_data.last_success == moment
+
+    async def _trigger_miss(self: DefaultAgent, user_input: ConversationInput) -> None:
+        del self, user_input
+        return None
+
+    async def _intent_failed(
+        self: DefaultAgent,
+        user_input: ConversationInput,
+        strict_intents_only: bool = False,
+    ) -> None:
+        del self, user_input, strict_intents_only
+        raise RuntimeError("секрет-намерения")
+
+    monkeypatch.setattr(DefaultAgent, "async_recognize_sentence_trigger", _trigger_miss)
+    monkeypatch.setattr(DefaultAgent, "async_recognize_intent", _intent_failed)
+    caplog.clear()
+    intended = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, "включи лампу", history=False),
+    )
+    await assert_empty_500(intended)
+    own = "\n".join(own_messages(caplog))
+    assert "секрет-намерения" not in own
+    assert_no_route_literals(own_messages(caplog))
+    assert "RuntimeError" in own
+    assert entry.runtime_data.conversation_id == "live-dialogue"
+    assert entry.runtime_data.last_success == moment
+
+
+@pytest.mark.parametrize(
+    ("method_name", "exc_type"),
+    [
+        ("async_recognize_sentence_trigger", asyncio.CancelledError),
+        ("async_recognize_sentence_trigger", KeyboardInterrupt),
+        ("async_recognize_sentence_trigger", SystemExit),
+        ("async_recognize_sentence_trigger", GeneratorExit),
+        ("async_recognize_intent", asyncio.CancelledError),
+        ("async_recognize_intent", KeyboardInterrupt),
+        ("async_recognize_intent", SystemExit),
+        ("async_recognize_intent", GeneratorExit),
+    ],
+)
+async def test_route_reraises_passthrough(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    exc_type: type[BaseException],
+) -> None:
+    """AC-N07: _route не превращает четыре базовых исключения в пустой 500."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    entry = await async_add_entry(hass, pipeline_id)
+    moment = dt_util.utcnow()
+    entry.runtime_data.conversation_id = "live-dialogue"
+    entry.runtime_data.last_success = moment
+
+    async def _boom(*_args: object, **_kwargs: object) -> None:
+        raise exc_type
+
+    monkeypatch.setattr(DefaultAgent, method_name, _boom)
+    turn = _TurnLog()
+    with pytest.raises(exc_type):
+        await ResponsesView()._route(hass, "включи лампу", turn)
+    assert turn.route is None
+    assert entry.runtime_data.conversation_id == "live-dialogue"
+    assert entry.runtime_data.last_success == moment
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    ["async_recognize_sentence_trigger", "async_recognize_intent"],
+)
+async def test_client_cancellation_is_not_empty_500(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    """AC-N07: отмена уходит клиенту, пустого HTTP 500 нет."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    moment = dt_util.utcnow()
+    entry.runtime_data.conversation_id = "live-dialogue"
+    entry.runtime_data.last_success = moment
+    await async_builtin_agent(hass)
+
+    async def _boom(*_args: object, **_kwargs: object) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(DefaultAgent, method_name, _boom)
+    client = await hass_client()
+    with pytest.raises((asyncio.CancelledError, ServerDisconnectedError)):
+        await client.post(
+            RESPONSES_URL,
+            json=classify_body(entry.entry_id, "включи лампу", history=False),
+        )
+    assert entry.runtime_data.conversation_id == "live-dialogue"
+    assert entry.runtime_data.last_success == moment
 
 
 async def test_classify_without_token_is_401(
@@ -1129,14 +1459,7 @@ async def test_classify_without_token_is_401(
     """SEC-AC-01: без токена Home Assistant отвечает 401 до ветки и конвейера."""
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
     forbid_pipeline(monkeypatch)
-
-    def _forbidden(*_args: object, **_kwargs: object) -> str:
-        raise AssertionError("маршрут")
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.http.match_route",
-        _forbidden,
-    )
+    seen = watch_route(monkeypatch)
     entry = await async_add_entry(hass, pipeline_id)
     client = await aiohttp_client(hass.http.app)
     response = await client.post(
@@ -1144,6 +1467,7 @@ async def test_classify_without_token_is_401(
         json=classify_body(entry.entry_id, "включи лампу", history=False),
     )
     assert response.status == 401
+    assert seen == []
 
 
 async def test_token_is_not_stored_on_classify(
@@ -1154,12 +1478,10 @@ async def test_token_is_not_stored_on_classify(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """SEC-AC-01b: токен ветки не попадает в запись, настройки и runtime_data."""
+    del monkeypatch
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
     entry = await async_add_entry(hass, pipeline_id)
-    await async_setup_automations(
-        hass,
-        [automation_item("Лампа", "включи лампу")],
-    )
+    await async_setup_automations(hass, [automation_item("Лампа", "включи лампу")])
     client = await hass_client(hass_read_only_access_token)
     phrase = "включи лампу"
     response = await client.post(
@@ -1184,6 +1506,41 @@ async def test_token_is_not_stored_on_classify(
     assert hass_access_token not in stored
     assert phrase not in stored
     assert "Bearer" not in stored
+    assert "agent_id" not in entry.data
+    assert "agent_id" not in entry.options
+
+
+async def test_classify_does_not_read_body_dialogue_or_pipeline(
+    hass: HomeAssistant,
+    hass_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC-AC-03: на ветке не читаются диалог и конвейер из тела."""
+    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
+    forbid_pipeline(monkeypatch)
+    entry = await async_add_entry(hass, pipeline_id)
+    moment = dt_util.utcnow()
+    entry.runtime_data.conversation_id = "live-dialogue"
+    entry.runtime_data.last_success = moment
+    await async_setup_automations(hass, [automation_item("Лампа", "включи лампу")])
+
+    async def _guarded(request: Any) -> object:
+        loaded = await async_load_json_body(request)
+        assert isinstance(loaded, dict)
+        return _Guard(loaded)
+
+    monkeypatch.setattr(
+        "custom_components.quasar_assist.http.async_load_json_body",
+        _guarded,
+    )
+    client = await hass_client()
+    response = await client.post(
+        RESPONSES_URL,
+        json=classify_body(entry.entry_id, "включи лампу", history=False),
+    )
+    assert await read_route(response) == "llm"
+    assert entry.runtime_data.conversation_id == "live-dialogue"
+    assert entry.runtime_data.last_success == moment
 
 
 async def test_models_do_not_classify_or_log_phrase(
@@ -1192,17 +1549,10 @@ async def test_models_do_not_classify_or_log_phrase(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """GET /models не запускает конвейер и распознаватель и не пишет реплику."""
+    """GET /models не запускает конвейер и маршрут и не пишет реплику."""
     pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
     forbid_pipeline(monkeypatch)
-
-    def _forbidden(*_args: object, **_kwargs: object) -> str:
-        raise AssertionError("маршрут")
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.http.match_route",
-        _forbidden,
-    )
+    seen = watch_route(monkeypatch)
     entry = await async_add_entry(hass, pipeline_id)
     client = await hass_client()
     caplog.set_level("DEBUG", logger="custom_components.quasar_assist")
@@ -1212,404 +1562,4 @@ async def test_models_do_not_classify_or_log_phrase(
     payload = await response.json()
     assert {"id": entry.entry_id, "name": entry.title} in payload["data"]
     assert own_messages(caplog, level=logging.DEBUG) == []
-
-
-async def test_classify_cancellation_is_not_empty_500(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Отмена распознавания не становится пустым HTTP 500."""
-    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
-    entry = await async_add_entry(hass, pipeline_id)
-
-    def _cancel(_hass: HomeAssistant, _text: str) -> str:
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(
-        "custom_components.quasar_assist.http.match_route",
-        _cancel,
-    )
-    client = await hass_client()
-    with pytest.raises((asyncio.CancelledError, ServerDisconnectedError)):
-        await client.post(
-            RESPONSES_URL,
-            json=classify_body(entry.entry_id, "включи лампу", history=False),
-        )
-
-
-def entity_is_on(hass: HomeAssistant, alias: str) -> bool:
-    """Сущность автоматизации с этим именем включена."""
-    for entity in hass.data[DATA_COMPONENT].entities:
-        if entity.name == alias and hass.states.is_state(entity.entity_id, "on"):
-            return True
-    return False
-
-
-def _raw_enabled(hass: HomeAssistant, alias: str) -> object:
-    """Исходная строка enabled из сырого конфига автоматизации."""
-    for entity in hass.data[DATA_COMPONENT].entities:
-        if entity.name == alias:
-            raw_config = entity.raw_config
-            if not isinstance(raw_config, dict):
-                continue
-            triggers = raw_config["triggers"]
-            return triggers[0]["enabled"]
-    return None
-
-
-async def _classify_route(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    items: list[dict[str, Any]],
-    phrase: str,
-    caplog: pytest.LogCaptureFixture | None = None,
-) -> tuple[str, list[Any]]:
-    """Поднять автоматизации и вернуть маршрут фразы и события действия."""
-    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
-    forbid_pipeline(monkeypatch)
-    entry = await async_add_entry(hass, pipeline_id)
-    await async_setup_automations(hass, items)
-    if caplog is not None:
-        caplog.set_level(logging.DEBUG, logger="custom_components.quasar_assist")
-        caplog.clear()
-    fired = listen(hass)
-    client = await hass_client()
-    response = await client.post(
-        RESPONSES_URL,
-        json=classify_body(entry.entry_id, phrase, history=False),
-    )
-    return await read_route(response), fired
-
-
-async def test_nested_trigger_wrapper_matches(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Команда только внутри обёртки triggers даёт llm, действие молчит."""
-    phrase = "команда внутри обёртки"
-    item = {
-        "alias": "Обёртка",
-        "triggers": [
-            {
-                "triggers": [
-                    {"platform": "conversation", "command": phrase},
-                ]
-            }
-        ],
-        "actions": [{"event": PROBE_EVENT}],
-    }
-    route, fired = await _classify_route(
-        hass,
-        hass_client,
-        monkeypatch,
-        [item],
-        phrase,
-    )
-    assert route == "llm"
-    assert fired == []
-    assert entity_is_on(hass, "Обёртка")
-
-
-async def test_triggers_value_wrapper_is_llm(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Значение ключа triggers — словарь-обёртка: llm, действие молчит."""
-    phrase = "команда обёртки значением"
-    item = {
-        "alias": "Обёртка значением",
-        "triggers": {
-            "triggers": [
-                {"platform": "conversation", "command": phrase},
-            ]
-        },
-        "actions": [{"event": PROBE_EVENT}],
-    }
-    route, fired = await _classify_route(
-        hass,
-        hass_client,
-        monkeypatch,
-        [item],
-        phrase,
-    )
-    assert route == "llm"
-    assert fired == []
-    assert entity_is_on(hass, "Обёртка значением")
-
-
-async def test_trigger_wrapper_with_extra_key_is_yandex(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Лишний ключ у обёртки не берёт команду, действие молчит."""
-    phrase = "команда за лишним ключом"
-    item = {
-        "alias": "Лишний ключ",
-        "triggers": [
-            {
-                "triggers": [
-                    {"platform": "conversation", "command": phrase},
-                ],
-                "id": "extra",
-            }
-        ],
-        "actions": [{"event": PROBE_EVENT}],
-    }
-    assert commands_in_config(item) == []
-    route, fired = await _classify_route(
-        hass,
-        hass_client,
-        monkeypatch,
-        [item],
-        phrase,
-    )
-    assert route == "yandex"
-    assert fired == []
-
-
-async def test_enabled_template_false_is_yandex(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Шаблон enabled, который рендерится в ложь, даёт yandex."""
-    phrase = "команда выключенного шаблона"
-    route, fired = await _classify_route(
-        hass,
-        hass_client,
-        monkeypatch,
-        [automation_item("Шаблон ложь", phrase, enabled="{{ false }}")],
-        phrase,
-    )
-    assert route == "yandex"
-    assert fired == []
-    assert entity_is_on(hass, "Шаблон ложь")
-
-
-async def test_enabled_boolean_and_static_strings(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """false и off дают yandex, true и нешаблонная строка — llm.
-
-    Совпадение не запускает автоматизацию.
-    """
-    cases = (
-        ("false", "yandex", "Строка false"),
-        ("off", "yandex", "Строка off"),
-        ("true", "llm", "Строка true"),
-        ("лампа", "llm", "Строка лампа"),
-    )
-    items: list[dict[str, Any]] = []
-    expected: list[tuple[str, str, str, str]] = []
-    for enabled, route, alias in cases:
-        phrase = f"команда enabled {enabled}"
-        items.append(automation_item(alias, phrase, enabled=enabled))
-        expected.append((phrase, route, alias, enabled))
-    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
-    forbid_pipeline(monkeypatch)
-    entry = await async_add_entry(hass, pipeline_id)
-    await async_setup_automations(hass, items)
-    fired = listen(hass)
-    client = await hass_client()
-    for phrase, route, alias, enabled in expected:
-        assert entity_is_on(hass, alias)
-        assert _raw_enabled(hass, alias) == enabled
-        response = await client.post(
-            RESPONSES_URL,
-            json=classify_body(entry.entry_id, phrase, history=False),
-        )
-        assert await read_route(response) == route
-    assert fired == []
-
-
-async def test_enabled_template_true_is_llm(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Шаблон enabled, который рендерится в истину, даёт llm."""
-    phrase = "команда включённого шаблона"
-    route, fired = await _classify_route(
-        hass,
-        hass_client,
-        monkeypatch,
-        [automation_item("Шаблон истина", phrase, enabled="{{ true }}")],
-        phrase,
-    )
-    assert route == "llm"
-    assert fired == []
-    assert entity_is_on(hass, "Шаблон истина")
-
-
-async def test_enabled_template_error_is_yandex_without_log(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """TemplateError в enabled даёт yandex, маркер не пишется, это не HTTP 500."""
-    phrase = "команда ошибочного шаблона"
-    enabled = "{{ quasar_enabled_marker / 0 }}"
-    with pytest.raises(TemplateError) as caught:
-        Template(enabled, hass).async_render({"this": None}, limited=True)
-    assert "quasar_enabled_marker" in str(caught.value)
-    route, fired = await _classify_route(
-        hass,
-        hass_client,
-        monkeypatch,
-        [automation_item("Ошибка шаблона", phrase, enabled=enabled)],
-        phrase,
-        caplog,
-    )
-    assert route == "yandex"
-    assert fired == []
-    assert entity_is_on(hass, "Ошибка шаблона")
-    assert "quasar_enabled_marker" not in "\n".join(own_messages(caplog))
-    assert "quasar_enabled_marker" not in caplog.text
-
-
-async def test_trigger_variable_feeds_enabled_template(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Переменная триггера входит в enabled: истина даёт llm, ложь — yandex."""
-    phrase_on = "команда включённой переменной"
-    phrase_off = "команда выключенной переменной"
-    pipeline_id, _engine = await async_create_pipeline(hass, "Спальня")
-    forbid_pipeline(monkeypatch)
-    entry = await async_add_entry(hass, pipeline_id)
-    await async_setup_automations(
-        hass,
-        [
-            {
-                "alias": "Переменная истина",
-                "trigger_variables": {"ready": "{{ true }}"},
-                "triggers": [
-                    {
-                        "platform": "conversation",
-                        "command": phrase_on,
-                        "enabled": "{{ ready }}",
-                    }
-                ],
-                "actions": [{"event": PROBE_EVENT}],
-            },
-            {
-                "alias": "Переменная ложь",
-                "trigger_variables": {"ready": "{{ false }}"},
-                "triggers": [
-                    {
-                        "platform": "conversation",
-                        "command": phrase_off,
-                        "enabled": "{{ ready }}",
-                    }
-                ],
-                "actions": [{"event": PROBE_EVENT}],
-            },
-        ],
-    )
-    assert entity_is_on(hass, "Переменная истина")
-    assert entity_is_on(hass, "Переменная ложь")
-    fired = listen(hass)
-    client = await hass_client()
-    opened = await client.post(
-        RESPONSES_URL,
-        json=classify_body(entry.entry_id, phrase_on, history=False),
-    )
-    closed = await client.post(
-        RESPONSES_URL,
-        json=classify_body(entry.entry_id, phrase_off, history=False),
-    )
-    assert await read_route(opened) == "llm"
-    assert await read_route(closed) == "yandex"
-    assert fired == []
-
-
-async def test_trigger_variable_error_skips_commands(
-    hass: HomeAssistant,
-    hass_client: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Ошибка переменных триггера не даёт команд и не пишет текст исключения."""
-    phrase = "команда сломанной переменной"
-    marker = "quasar_var_marker"
-    route, fired = await _classify_route(
-        hass,
-        hass_client,
-        monkeypatch,
-        [
-            {
-                "alias": "Сломанная переменная",
-                "trigger_variables": {"ready": "{{ quasar_var_marker / 0 }}"},
-                "triggers": [
-                    {"platform": "conversation", "command": phrase},
-                ],
-                "actions": [{"event": PROBE_EVENT}],
-            }
-        ],
-        phrase,
-        caplog,
-    )
-    assert route == "yandex"
-    assert fired == []
-    assert entity_is_on(hass, "Сломанная переменная")
-    assert marker not in "\n".join(own_messages(caplog))
-    assert marker not in caplog.text
-
-
-async def test_computed_template_object_enabled(hass: HomeAssistant) -> None:
-    """Готовый объект Template включается по результату рендера."""
-    command = "команда объекта"
-    off = Template("{{ false }}", hass)
-    on = Template("{{ true }}", hass)
-    broken = Template("{{ quasar_enabled_marker / 0 }}", hass)
-    assert (
-        commands_in_config(
-            {
-                "triggers": [
-                    {
-                        "platform": "conversation",
-                        "command": command,
-                        "enabled": off,
-                    }
-                ]
-            },
-            hass,
-        )
-        == []
-    )
-    assert commands_in_config(
-        {
-            "triggers": [
-                {
-                    "platform": "conversation",
-                    "command": command,
-                    "enabled": on,
-                }
-            ]
-        },
-        hass,
-    ) == [command]
-    assert (
-        commands_in_config(
-            {
-                "triggers": [
-                    {
-                        "platform": "conversation",
-                        "command": command,
-                        "enabled": broken,
-                    }
-                ]
-            },
-            hass,
-        )
-        == []
-    )
+    assert seen == []

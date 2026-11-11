@@ -133,11 +133,11 @@ A person says "Алиса Львовна, включи свет". The speaker wa
 
 ## Classify route
 
-If the first `system` message is the string `classify` with no spaces around it, Quasar Assist does not run the Assist pipeline. The reply is still HTTP 200 and the same completed message. `output_text` is a JSON object whose only field is `route`. The value is `llm` when the last user phrase would match an enabled `conversation` trigger of an automation that is on, and `yandex` when it would not. This integration does not return the route `home`. A match does not run the automation and does not change the dialogue timer. The route does not depend on whether the selected pipeline is available.
+If the first `system` message is the string `classify` with no spaces around it, Quasar Assist does not run the Assist pipeline. The reply is still HTTP 200 and the same completed message. `output_text` is a JSON object whose only field is `route`. The built-in agent checks registered `conversation` triggers first, including triggers of scripts, and then a strict intent. A match gives `llm`. Otherwise the value is `yandex`. This integration does not return the route `home`. A match does not execute the automation, the script, or the intent, and it does not change the dialogue timer. The route does not depend on whether the selected pipeline is available. The pipeline's own agent is not called.
 
-An unknown entry answers before that logic: HTTP 200 and a short phrase, including when the phrase is empty and when the system message is `classify`. The sentence recognizer is not started.
+An unknown entry answers before that logic: HTTP 200 and a short phrase, including when the phrase is empty and when the system message is `classify`. The agent methods are not started.
 
-When the entry is found, an empty phrase on this route answers HTTP 500 with an empty body. Listing automations or the sentence recognizer failing answers the same HTTP 500 with an empty body. The body is empty: not JSON and not a short phrase. The pipeline is not started, and the dialogue is left as it was.
+When the entry is found, an empty phrase on this route answers HTTP 500 with an empty body. The same empty HTTP 500 is returned when the built-in agent is missing or when either of the two recognition methods raises any other exception. `asyncio.CancelledError`, `KeyboardInterrupt`, `SystemExit`, and `GeneratorExit` are not this failure. The body is empty: not JSON and not a short phrase. The pipeline is not started, and the dialogue is left as it was.
 
 The last user phrase and the pipeline reply speech are written only in one debug line for each `POST /api/quasar_assist/v1/responses`. Information, warning, error, and the downloadable diagnostics do not contain them. In Home Assistant open Settings, then System, then Logs, and search for `quasar_assist`.
 
